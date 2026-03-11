@@ -1,0 +1,9 @@
+.env
+*.key
+*.pem
+
+# data outputs
+data/
+out/
+
+pod-c.txt
