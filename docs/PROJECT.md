@@ -1,74 +1,74 @@
 ## Project overview
 
-`quant-pod-c` is a small Kalshi REST ingestion utility meant to download data locally for exploratory analysis.
+`quant-pod-c` downloads Kalshi market and trade data to your machine for analysis.
 
-It currently supports:
-- `GET /markets` to collect market metadata
-- `GET /markets/trades` to collect executed trades
+**What it does:**
+- Calls `GET /markets` to download market metadata.
+- Calls `GET /markets/trades` to download executed trades.
 
-Outputs are written to a local folder (default `data/kalshi/`) as:
-- raw paginated responses in `*.jsonl`
-- flattened tables in `*.csv`
+**Where data goes:** A folder you choose (default `data/kalshi/`). You get raw API pages in `*.jsonl` and flat tables in `*.csv`.
 
 ## Folder layout
 
-- `requirements.txt`
-  - Python dependencies.
-- `.env.example`
-  - Template for environment variables required for authentication.
-- `kalshi_ingest/`
-  - Python package implementing auth, HTTP client, ingestion logic, and CLI.
-- `docs/`
-  - Documentation for the project and function reference.
+| Path | Purpose |
+|------|--------|
+| `requirements.txt` | Python dependencies |
+| `.env.example` | Template for API key and key file path |
+| `kalshi_ingest/` | Code: auth, client, ingest, CLI |
+| `docs/` | This doc and the function reference |
 
-## How it works (module interactions)
+## How the pieces fit together
 
-- `kalshi_ingest.auth.KalshiAuth`
-  - Reads configuration from environment variables.
-  - Loads the Kalshi RSA private key.
-  - Creates request signatures used for authenticated REST calls.
-
-- `kalshi_ingest.client.KalshiClient`
-  - Wraps `requests` with Kalshi authentication headers.
-  - Provides `get()` for single REST calls.
-  - Provides `paginate()` to iterate cursor-based endpoints and yield full pages.
-
-- `kalshi_ingest.ingest`
-  - Calls `KalshiClient.paginate()` for specific endpoints.
-  - Writes raw pages to JSONL and flattens list payloads into CSV.
-
-- `kalshi_ingest.save`
-  - Small filesystem helpers used by ingestion functions.
-
-- `kalshi_ingest.cli`
-  - Command-line entry point.
-  - Loads `.env` (or a provided env file), constructs the client, runs ingestion, prints paths.
+1. **auth** — Reads `.env`, loads your private key, signs each request.
+2. **client** — Sends signed GET requests and handles pagination (cursor).
+3. **ingest** — Uses the client to fetch markets or trades, then writes JSONL and CSV.
+4. **cli** — Parses your command, loads env, runs the right ingest and prints where files were saved.
 
 ## Setup
 
-From `quant-pod-c/`:
+In `quant-pod-c/`:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Create `.env` in `quant-pod-c/` (copy from `.env.example`) and set:
+Create `.env` (copy from `.env.example`) and set:
 - `KALSHI_API_KEY_ID`
 - `KALSHI_PRIVATE_KEY_PATH`
-- `KALSHI_BASE_URL` (demo or prod base URL ending with `/trade-api/v2`)
+- `KALSHI_BASE_URL` (demo or prod)
 
 ## Run
 
 From `quant-pod-c/`:
 
+**Markets:**
 ```bash
 python -m kalshi_ingest markets --out-dir data/kalshi
+```
+
+**Trades for a specific market:**  
+Use the **exact** ticker from the API: **uppercase** and **include the suffix** (e.g. `-EWU`). Wrong format = no data.
+
+```bash
+python -m kalshi_ingest trades --ticker KXNCAAMBGAME-26MAR10IDHOEWU-EWU --out-dir data/kalshi
+```
+
+To see the correct ticker format, run:
+
+```bash
+python -m kalshi_ingest trades-sample --limit 100
+```
+
+That prints sample tickers from the API so you can copy the right one.
+
+**All trades (no ticker filter):**
+```bash
 python -m kalshi_ingest trades --out-dir data/kalshi
 ```
 
-Common options:
-- `--env-file PATH`: load env vars from a specific file
-- `--out-dir PATH`: output folder for saved data
-- `markets`: `--status`, `--series-ticker`, `--event-ticker`, `--tickers`, `--limit`
+**Useful options:**
+- `--env-file PATH` — use a specific `.env` file
+- `--out-dir PATH` — where to save files
 - `trades`: `--ticker`, `--min-ts`, `--max-ts`, `--limit`
+- `markets`: `--status`, `--series-ticker`, `--event-ticker`, `--tickers`, `--limit`
 

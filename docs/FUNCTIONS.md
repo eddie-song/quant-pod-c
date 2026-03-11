@@ -79,6 +79,11 @@ This document describes the main functions/classes exposed by the package and wh
   - `trades_raw_<timestamp>.jsonl`
   - `trades_flat_<timestamp>.csv` (or a `.txt` note if CSV write fails)
 - **Filters** (optional): `ticker`, `min_ts`, `max_ts`
+- **Ticker**: Use the exact ticker from the API (uppercase, including suffix e.g. `-EWU`). Use `trades-sample` to see the format.
+
+#### `fetch_trades_sample(client: KalshiClient, limit: int = 10) -> dict`
+- **Purpose**: Fetch one page of trades with no ticker filter. Used to check the API and to see sample ticker strings.
+- **Returns**: Dict with `count`, `cursor`, `tickers_sample` (list of ticker strings), and `raw_page`.
 
 #### `IngestResult`
 - **Fields**:
@@ -89,6 +94,6 @@ This document describes the main functions/classes exposed by the package and wh
 ### `kalshi_ingest.cli`
 
 #### `main() -> int`
-- **Purpose**: Parse CLI args and run a subcommand.
+- **Purpose**: Parse CLI args and run a subcommand (`markets`, `trades`, `trades-sample`).
 - **Returns**: process exit code.
 

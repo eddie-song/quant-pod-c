@@ -1,54 +1,71 @@
-# quant-pod-c: Kalshi data ingestion (simple)
+# quant-pod-c: Kalshi data ingestion
 
-This folder contains a small Kalshi REST ingestion utility to download data locally for EDA.
+A small tool to download Kalshi market and trade data to your machine for analysis. Run from the `quant-pod-c` folder.
 
 ## Setup
-
-Create a virtualenv, then:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and fill:
+Copy `.env.example` to `.env` and set:
 
-- `KALSHI_API_KEY_ID`
-- `KALSHI_PRIVATE_KEY_PATH` (path to the downloaded `.key`)
-- `KALSHI_BASE_URL` (defaults to demo)
+- `KALSHI_API_KEY_ID` — your API key from Kalshi
+- `KALSHI_PRIVATE_KEY_PATH` — path to your downloaded `.key` file
+- `KALSHI_BASE_URL` — demo or prod (defaults to demo)
 
 ## Commands
 
-All commands save:
+Outputs go to `--out-dir` (default `data/kalshi`):
 
-- **raw** pages as `.jsonl` (one JSON object per line)
-- **flat** tables as `.csv` for quick EDA
+- **Raw** API pages → `*.jsonl`
+- **Flat** tables → `*.csv` (for EDA)
 
 ### Download markets
 
 ```bash
-python -m kalshi_ingest.cli markets --out-dir data/kalshi
+python -m kalshi_ingest markets --out-dir data/kalshi
 ```
 
-Optional filters (passed through to Kalshi `GET /markets`):
+With filters:
 
 ```bash
-python -m kalshi_ingest.cli markets --status open --limit 500 --out-dir data/kalshi
+python -m kalshi_ingest markets --status open --limit 500 --out-dir data/kalshi
 ```
 
 ### Download trades
 
-```bash
-python -m kalshi_ingest.cli trades --out-dir data/kalshi
-```
-
-Filter to a ticker and/or time window (unix seconds):
+All trades (no filter):
 
 ```bash
-python -m kalshi_ingest.cli trades --ticker SOME-TICKER --min-ts 1700000000 --max-ts 1710000000 --out-dir data/kalshi
+python -m kalshi_ingest trades --out-dir data/kalshi
 ```
 
-## Notes
+Trades for one market (use exact ticker from API):
 
-- Auth follows Kalshi docs: `KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP` (ms), `KALSHI-ACCESS-SIGNATURE` (RSA-PSS SHA256, base64).
-- This is intentionally minimal; we can add richer schemas/Parquet later once you’re happy with the basics.
+```bash
+python -m kalshi_ingest trades --ticker KXNCAAMBGAME-26MAR10IDHOEWU-EWU --out-dir data/kalshi
+```
+
+**Important:** Use the **exact** market ticker from the API: **uppercase** and **include the suffix** (e.g. `-EWU`). If you use the wrong format, you get no rows. To see the correct ticker format, run:
+
+```bash
+python -m kalshi_ingest trades-sample --limit 100
+```
+
+That prints recent tickers as returned by the API so you can copy the right one.
+
+Optional: limit by time (Unix seconds):
+
+```bash
+python -m kalshi_ingest trades --ticker KXNCAAMBGAME-26MAR10IDHOEWU-EWU --min-ts 1700000000 --max-ts 1710000000 --out-dir data/kalshi
+```
+
+### Check that the API returns trades
+
+```bash
+python -m kalshi_ingest trades-sample --limit 100
+```
+
+Shows how many trades came back and sample tickers. Use this to confirm your env and to get the exact ticker string for a market.
 
