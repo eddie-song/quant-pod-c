@@ -15,6 +15,7 @@ class IngestResult:
     note: Optional[str] = None
 
 
+# Download all pages from `GET /markets`, save raw JSONL and flattened CSV
 def ingest_markets(
     client: KalshiClient,
     out_dir: str | Path,
@@ -41,6 +42,7 @@ def ingest_markets(
     raw_rows: List[Dict[str, Any]] = []
     flat: List[Dict[str, Any]] = []
 
+    # Reads the data for all markets pulled
     for page, cursor_used in client.paginate("/markets", params=params, limit=limit):
         raw_rows.append(
             {
@@ -68,6 +70,7 @@ def ingest_markets(
     return IngestResult(raw_jsonl_path=str(raw_path), flat_csv_path=str(csv_path))
 
 
+# Download all pages from `GET /markets/trades`, save raw JSONL and flattened CSV
 def ingest_trades(
     client: KalshiClient,
     out_dir: str | Path,
@@ -118,6 +121,7 @@ def ingest_trades(
     return IngestResult(raw_jsonl_path=str(raw_path), flat_csv_path=str(csv_path))
 
 
+# Fetch one page of trades with no ticker filter. Used to check the API and to see sample ticker strings.
 def fetch_trades_sample(client: KalshiClient, limit: int = 10) -> Dict[str, Any]:
     page = client.get("/markets/trades", params={"limit": limit})
     trades = page.get("trades", []) or []
