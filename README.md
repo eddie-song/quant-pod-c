@@ -69,3 +69,32 @@ python -m kalshi_ingest trades-sample --limit 100
 
 Shows how many trades came back and sample tickers. Use this to confirm your env and to get the exact ticker string for a market.
 
+### Download orderbooks
+
+Orderbook for one market (full depth):
+
+```bash
+python -m kalshi_ingest orderbook --tickers KXNCAAMBGAME-26MAR10IDHOEWU-EWU --out-dir data/kalshi
+```
+
+Multiple markets at once (comma-separated):
+
+```bash
+python -m kalshi_ingest orderbook --tickers TICKER1,TICKER2,TICKER3 --out-dir data/kalshi
+```
+
+Limit to 10 price levels per side:
+
+```bash
+python -m kalshi_ingest orderbook --tickers TICKER1,TICKER2 --depth 10 --out-dir data/kalshi
+```
+
+The flat CSV has one row per price level with columns: `fetched_at`, `ticker`, `side`, `price_cents`, `quantity`, `level_index`. If a ticker fails (e.g. invalid ticker), it is skipped and the rest continue.
+
+**Useful options:**
+
+- `--env-file PATH` — use a specific `.env` file
+- `--out-dir PATH` — where to save files
+- `trades`: `--ticker`, `--min-ts`, `--max-ts`, `--limit`
+- `markets`: `--status`, `--series-ticker`, `--event-ticker`, `--tickers`, `--limit`
+- `orderbook`: `--tickers` (required, comma-separated), `--depth`

@@ -85,6 +85,17 @@ This document describes the main functions/classes exposed by the package and wh
 - **Purpose**: Fetch one page of trades with no ticker filter. Used to check the API and to see sample ticker strings.
 - **Returns**: Dict with `count`, `cursor`, `tickers_sample` (list of ticker strings), and `raw_page`.
 
+#### `ingest_orderbook(client: KalshiClient, out_dir: str | Path, tickers: List[str], *, depth: Optional[int] = None) -> IngestResult`
+- **Purpose**: Download orderbook snapshots from `GET /markets/{ticker}/orderbook` for each ticker in the list.
+- **Output files**:
+  - `orderbook_raw_<timestamp>.jsonl` — one JSON object per ticker with the full API response
+  - `orderbook_flat_<timestamp>.csv` — one row per price level (or a `.txt` note if CSV write fails)
+- **Flat CSV columns**: `fetched_at`, `ticker`, `side` (`yes`/`no`), `price_cents`, `quantity`, `level_index`
+- **Parameters**:
+  - `tickers` (required): list of market ticker strings
+  - `depth` (optional): number of price levels per side; omit for full depth
+- **Error handling**: If a ticker fails, it is skipped and listed in `IngestResult.note`. The rest continue.
+
 #### `IngestResult`
 - **Fields**:
   - `raw_jsonl_path`: path to the JSONL file
@@ -94,6 +105,6 @@ This document describes the main functions/classes exposed by the package and wh
 ### `kalshi_ingest.cli`
 
 #### `main() -> int`
-- **Purpose**: Parse CLI args and run a subcommand (`markets`, `trades`, `trades-sample`).
+- **Purpose**: Parse CLI args and run a subcommand (`markets`, `trades`, `trades-sample`, `orderbook`).
 - **Returns**: process exit code.
 

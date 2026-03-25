@@ -128,3 +128,76 @@ def fetch_trades_sample(client: KalshiClient, limit: int = 10) -> Dict[str, Any]
     tickers = list({t.get("ticker") for t in trades if isinstance(t, dict) and t.get("ticker")})
     return {"count": len(trades), "cursor": page.get("cursor", ""), "tickers_sample": tickers[:20], "raw_page": page}
 
+
+# Download orderbook snapshots for a list of tickers from GET /markets/{ticker}/orderbook
+def ingest_orderbook(
+    client: KalshiClient,
+    out_dir: str | Path,
+    tickers: List[str],
+    *,
+    depth: Optional[int] = None,
+) -> IngestResult:
+    out_dir = ensure_dir(out_dir)
+    stamp = client.now_utc_iso().replace(":", "").replace("+", "Z").replace(".", "")
+
+    raw_rows: List[Dict[str, Any]] = []
+    flat: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+
+    for ticker in tickers:
+        endpoint = f"/markets/{ticker}/orderbook"
+        params: Dict[str, Any] = {}
+        if depth is not None:
+            params["depth"] = depth
+
+        try:
+            page = client.get(endpoint, params=params or None)
+        except Exception as exc:
+            print(f"WARNING: orderbook fetch failed for {ticker!r}: {exc}")
+            skipped.append(ticker)
+            continue
+
+        fetched_at = client.now_utc_iso()
+        raw_rows.append(
+            {
+                "fetched_at": fetched_at,
+                "endpoint": endpoint,
+                "ticker": ticker,
+                "depth": depth,
+                "page": page,
+            }
+        )
+
+        orderbook_fp = page.get("orderbook_fp", {}) or {}
+        for key, label in [("yes_dollars", "yes"), ("no_dollars", "no")]:
+            levels = orderbook_fp.get(key, []) or []
+            for level_index, entry in enumerate(levels):
+                if isinstance(entry, list) and len(entry) >= 2:
+                    flat.append(
+                        {
+                            "fetched_at": fetched_at,
+                            "ticker": ticker,
+                            "side": label,
+                            "price_cents": entry[0],
+                            "quantity": entry[1],
+                            "level_index": level_index,
+                        }
+                    )
+
+    raw_path = out_dir / f"orderbook_raw_{stamp}.jsonl"
+    write_jsonl(raw_path, raw_rows)
+
+    csv_path = out_dir / f"orderbook_flat_{stamp}.csv"
+    err = try_write_csv(csv_path, flat)
+
+    note: Optional[str] = None
+    if skipped:
+        note = f"Skipped {len(skipped)} ticker(s): {', '.join(skipped)}"
+    if err:
+        atomic_write_text(out_dir / f"orderbook_flat_{stamp}.txt", f"Could not write CSV: {err}\n")
+        note = f"{note}; {err}" if note else err
+        return IngestResult(raw_jsonl_path=str(raw_path), flat_csv_path=None, note=note)
+
+    return IngestResult(raw_jsonl_path=str(raw_path), flat_csv_path=str(csv_path), note=note)
+
+

@@ -5,6 +5,7 @@
 **What it does:**
 - Calls `GET /markets` to download market metadata.
 - Calls `GET /markets/trades` to download executed trades.
+- Calls `GET /markets/{ticker}/orderbook` to download orderbook snapshots.
 
 **Where data goes:** A folder you choose (default `data/kalshi/`). You get raw API pages in `*.jsonl` and flat tables in `*.csv`.
 
@@ -21,7 +22,7 @@
 
 1. **auth** — Reads `.env`, loads your private key, signs each request.
 2. **client** — Sends signed GET requests and handles pagination (cursor).
-3. **ingest** — Uses the client to fetch markets or trades, then writes JSONL and CSV.
+3. **ingest** — Uses the client to fetch markets, trades, or orderbooks, then writes JSONL and CSV.
 4. **cli** — Parses your command, loads env, runs the right ingest and prints where files were saved.
 
 ## Setup
@@ -66,9 +67,15 @@ That prints sample tickers from the API so you can copy the right one.
 python -m kalshi_ingest trades --out-dir data/kalshi
 ```
 
+**Orderbook for multiple markets (10 levels deep):**
+```bash
+python -m kalshi_ingest orderbook --tickers TICKER1,TICKER2 --depth 10 --out-dir data/kalshi
+```
+
 **Useful options:**
 - `--env-file PATH` — use a specific `.env` file
 - `--out-dir PATH` — where to save files
 - `trades`: `--ticker`, `--min-ts`, `--max-ts`, `--limit`
 - `markets`: `--status`, `--series-ticker`, `--event-ticker`, `--tickers`, `--limit`
+- `orderbook`: `--tickers` (required, comma-separated), `--depth`
 
