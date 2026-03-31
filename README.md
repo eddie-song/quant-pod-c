@@ -135,7 +135,7 @@ The core filtering system. Runs the WebSocket stream, periodically pulls REST me
 - Evaluates every market every 60 seconds (configurable) against 7 checks:
   1. **No quotes** — bid or ask is zero → fail
   2. **Spread bounds** — must be between 3¢ and 40¢ (configurable)
-  3. **Decided** — bid ≥ $0.95 or ask ≤ $0.05 means the outcome is essentially known → fail
+  3. **Decided** — bid ≥ $0.95 or ask ≤ $0.05 means the outcome is essentially known → fail (configurable)
   4. **Expiry** — must have at least 30 minutes until expiration (configurable)
   5. **Volume** — dollar volume must exceed minimum (configurable)
   6. **Activity** — update rate (updates/min) must exceed minimum (configurable)
