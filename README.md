@@ -17,54 +17,62 @@ The core idea: penny-jump the best bid and ask (bid = best\_bid + 1¢, ask = bes
 ## Architecture
 
 ```
-REST Bootstrap (kalshi_ingest/)
+REST Bootstrap (kalshi_ingest/ → kalshi_filter/metadata)  ✅ BUILT
     GET /markets → initial market universe + metadata
+    Dict[str, MarketMetadata] refreshed every 5 min
             │
             ▼
-WebSocket Connection (kalshi_ws/)                     ✅ BUILT
+WebSocket Connection (kalshi_ws/)                          ✅ BUILT
     ticker channel → all markets top-of-book
     trade channel  → all market trades
             │
             ▼
-In-Memory State                                       ✅ BUILT
+In-Memory State                                            ✅ BUILT
     market_states: Dict[str, MarketTicker]
     trade_buffers: Dict[str, deque[Trade]]
             │
             ▼
-Tier 1 Filter                                         ⬜ NOT BUILT
-    spread, volume, activity, basic flow imbalance
-    → promotes candidates
+Configuration System (kalshi_filter/config)                ✅ BUILT
+    JSON config → typed dataclasses
+    all thresholds externalized
             │
             ▼
-Orderbook Subscriber                                  ⬜ NOT BUILT
+Tier 1 Filter (kalshi_filter/filter)                       ✅ BUILT
+    spread, volume, activity, imbalance, expiry, decided
+    IGNORED → WATCHING → DEMOTED → BLACKLISTED
+    escalating cooldowns, transition logging
+            │
+            ▼
+Orderbook Subscriber                                       ⬜ NOT BUILT
     subscribe to orderbook_delta for candidates only
     maintain live orderbook per candidate
             │
             ▼
-Tier 2 Analysis                                       ⬜ NOT BUILT
+Tier 2 Analysis                                            ⬜ NOT BUILT
     flow toxicity, fill probability, autocorrelation,
     ADF stationarity, effective edge
     → approve or reject for quoting
             │
             ▼
-Quoting Engine                                        ⬜ NOT BUILT
+Quoting Engine                                             ⬜ NOT BUILT
     penny-jump quotes, size based on metrics + inventory
     skew quotes away from inventory
             │
             ▼
-Execution                                             ⬜ NOT BUILT
+Execution                                                  ⬜ NOT BUILT
     place/cancel orders via REST API
     track resting orders
             │
             ▼
-Risk / Kill Switch                                    ⬜ NOT BUILT
+Risk / Kill Switch                                         ⬜ NOT BUILT
     per-market P&L limit, global P&L limit
     metric deterioration triggers demotion
             │
             ▼
-Persistence                                           🟡 PARTIAL
-    raw WS messages → JSONL                           ✅
-    metrics, transitions, P&L                         ⬜
+Persistence                                                🟡 PARTIAL
+    raw WS messages → JSONL                                ✅
+    state transitions → JSONL                              ✅
+    metrics snapshots, P&L                                 ⬜
 ```
 
 ## What Exists Today
@@ -80,24 +88,6 @@ Batch CLI tool for pulling data from Kalshi's REST API. All commands write raw J
 - Auth via RSA-PSS signed headers (`KalshiAuth`)
 - Output: `*_raw_{timestamp}.jsonl` + `*_flat_{timestamp}.csv`
 
-**Commands:**
-
-```bash
-# Download all open markets
-python3 -m kalshi_ingest markets --status open --out-dir data/kalshi
-
-# Download trades for a specific market
-python3 -m kalshi_ingest trades --ticker KXNCAAMBGAME-26MAR10IDHOEWU-EWU --out-dir data/kalshi
-
-# Check API connectivity and see sample ticker strings
-python3 -m kalshi_ingest trades-sample --limit 100
-
-# Download orderbook for specific markets
-python3 -m kalshi_ingest orderbook --tickers TICK1,TICK2 --depth 10 --out-dir data/kalshi
-```
-
-Options: `--env-file PATH`, `--out-dir PATH`, `--limit N`. Use exact ticker strings from the API (uppercase, with suffix).
-
 ---
 
 ### `kalshi_ws/` — WebSocket Data Foundation
@@ -112,20 +102,6 @@ Live async WebSocket client that streams real-time data for all active markets. 
 - Persists raw messages to daily JSONL files (`ticker_stream_YYYYMMDD.jsonl`, `trade_stream_YYYYMMDD.jsonl`)
 - Disk writes buffered and flushed in a background thread — never blocks the message loop
 
-**Run standalone:**
-
-```bash
-python3 -m kalshi_ws
-```
-
-**Environment overrides:**
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `KALSHI_WS_URL` | derived from `KALSHI_BASE_URL` | WebSocket endpoint (wss://…) |
-| `KALSHI_WS_OUT_DIR` | `data/kalshi/ws` | Directory for raw JSONL stream files |
-| `KALSHI_WS_TRADE_BUFFER` | `5000` | Max trades retained per market in memory |
-
 **Access state from downstream code:**
 
 ```python
@@ -138,10 +114,189 @@ sids   = get_subscription_ids()        # {"ticker": 1, "trade": 2}
 
 ---
 
+### `kalshi_filter/` — Tier 1 Filter + Orchestrator
+
+The core filtering system. Runs the WebSocket stream, periodically pulls REST metadata, and evaluates every market against configurable criteria. Contains five components:
+
+**Configuration (`config.py`):**
+- Loads all parameters from `config.json` (or a custom path via `KALSHI_CONFIG_PATH` env var)
+- Parses into typed, nested dataclasses — access as `config.tier1.min_spread`, not `config["tier1"]["min_spread"]`
+- Missing keys → uses defaults and prints a warning
+- Wrong types → raises `TypeError` immediately at startup
+- If no config file exists, writes one with all defaults for reference
+
+**REST Metadata Bootstrap (`metadata.py`):**
+- At startup, calls `ingest_markets(status="open")` to get expiration times, event tickers, and market status for all active markets
+- Reads the JSONL output back into `Dict[str, MarketMetadata]` keyed by ticker
+- Refreshes every 5 minutes (configurable) in a background thread via `asyncio.to_thread`
+- Accessors: `get_market_metadata()`, `get_metadata(ticker)`
+
+**Tier 1 Filter (`filter.py`):**
+- Evaluates every market every 60 seconds (configurable) against 7 checks:
+  1. **No quotes** — bid or ask is zero → fail
+  2. **Spread bounds** — must be between 3¢ and 40¢ (configurable)
+  3. **Decided** — bid ≥ $0.95 or ask ≤ $0.05 means the outcome is essentially known → fail
+  4. **Expiry** — must have at least 30 minutes until expiration (configurable)
+  5. **Volume** — dollar volume must exceed minimum (configurable)
+  6. **Activity** — update rate (updates/min) must exceed minimum (configurable)
+  7. **Imbalance** — if enough trades exist, the yes/no taker ratio must not deviate too far from 50/50 (configurable)
+- 4-state lifecycle per market: `IGNORED` → `WATCHING` → `DEMOTED` → `BLACKLISTED`
+- Promotion requires N consecutive passes (default 5). Demotion after N consecutive fails (default 3).
+- Escalating cooldowns: 15 min → 2 hours → permanent blacklist (configurable)
+- Accessors: `get_candidates()`, `get_market_status(ticker)`, `get_all_trackers()`
+
+**Transition Logger (`transitions.py`):**
+- Every status change is printed to console with formatted metrics and written to a daily JSONL file
+- End-of-cycle summary: `EVAL: 347 markets | 12 WATCHING | 3 DEMOTED | 2 BLACKLISTED | 330 IGNORED`
+- JSONL records include timestamp, ticker, old/new status, metrics snapshot
+
+**Orchestrator (`__main__.py`):**
+- Loads config → bootstraps metadata → starts WS stream → waits for initial data → runs metadata refresh loop + evaluation loop
+- Handles graceful shutdown on Ctrl+C
+
+---
+
 ### Tests
 
-- 8 unit tests covering WebSocket data model parsing, string-to-float conversion, spread derivation, partial updates, and deque bounds
-- Run: `python3 -m pytest tests/test_ws_models.py -v`
+34 unit tests across two files:
+
+**`tests/test_ws_models.py`** — 8 tests:
+- String-to-float parsing (`"0.52"` → `0.52`)
+- `MarketTicker.from_msg()` construction and field correctness
+- `MarketTicker.update()` partial merge
+- Spread derivation (`yes_ask - yes_bid`)
+- `Trade.from_msg()` construction
+- Deque max length enforcement
+
+**`tests/test_filter.py`** — 26 tests:
+- Config loading: default generation, missing key handling, type validation, missing section
+- `MarketMetadata` parsing from API dict, ISO timestamp parsing
+- `evaluate_market` with 11 scenarios: pass all, spread too tight, spread too wide, decided YES, decided NO, extreme imbalance, insufficient trades (imbalance skipped), no quotes, low volume, low activity, expiring soon, missing metadata (expiry skipped)
+- Promotion: requires N consecutive passes, resets on fail
+- Demotion: triggers after N consecutive fails, correct cooldown duration
+- Cooldown: blocks re-evaluation during cooldown, expires correctly, second demotion has longer cooldown
+- Blacklist: triggers after max demotions
+- Transition logging: JSONL record has correct fields
+
+## Running the System
+
+### Prerequisites
+
+- Python 3.10+
+- Kalshi API key — set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH` in `.env` (see `.env.example`)
+- `pip install -r requirements.txt`
+
+### Run the full system (WebSocket + Tier 1 Filter)
+
+This is the primary entry point. It connects to Kalshi, streams all market data, and continuously evaluates markets:
+
+```bash
+python3 -m kalshi_filter
+```
+
+On startup you'll see:
+```
+Kalshi Market-Making System — Tier 1 Filter
+Config: config.json
+Metadata refresh: every 300s
+Evaluation interval: every 60s
+Loaded metadata for 347 active markets
+WebSocket stream started. Waiting for initial data...
+Receiving data for 312 markets
+FIRST EVAL: 312 markets scanned | 0 WATCHING (need 5 consecutive passes)
+```
+
+After several evaluation cycles (5+ minutes), markets that consistently pass all filters will be promoted:
+```
+[2026-03-30 23:15:01] PROMOTED KXBTC-26APR01-T100000: IGNORED → WATCHING
+    spread=0.080  volume=$1250  imbalance=0.48  rate=3.2/min  passes=5/5
+[2026-03-30 23:15:01] EVAL: 347 markets | 1 WATCHING | 0 DEMOTED | 0 BLACKLISTED | 346 IGNORED
+```
+
+### Run the WebSocket stream only (no filter)
+
+Useful for collecting raw data without running the filter:
+
+```bash
+python3 -m kalshi_ws
+```
+
+### Batch REST ingestion
+
+```bash
+# Download all open markets
+python3 -m kalshi_ingest markets --status open --out-dir data/kalshi
+
+# Download trades for a specific market
+python3 -m kalshi_ingest trades --ticker SOMETICKER --out-dir data/kalshi
+
+# Check API connectivity and see sample ticker strings
+python3 -m kalshi_ingest trades-sample --limit 100
+
+# Download orderbook snapshots
+python3 -m kalshi_ingest orderbook --tickers TICK1,TICK2 --out-dir data/kalshi
+```
+
+### Verifying that things work
+
+**1. Run the test suite** — this is the fastest way to confirm all parsing, filtering, config loading, and lifecycle logic works without needing API credentials:
+
+```bash
+python3 -m pytest tests/ -v
+```
+
+What the tests prove:
+- **Config system works**: loads JSON, fills missing keys with defaults, rejects wrong types
+- **Data parsing is correct**: WebSocket string-to-float conversion, ISO timestamp parsing, spread derivation, partial updates all produce the right values
+- **Filter logic is correct**: each of the 7 checks (spread, decided, expiry, volume, activity, imbalance, no quotes) correctly passes or fails on synthetic data
+- **Lifecycle state machine is correct**: promotion requires N consecutive passes, demotion triggers after N consecutive fails, cooldowns block re-evaluation for the right duration, escalating cooldowns grow, blacklist triggers after max demotions
+- **Transition logger produces valid JSONL**: records have all required fields (timestamp, ticker, statuses, metrics)
+
+**2. Verify REST connectivity** — confirms your API credentials work and you can reach Kalshi:
+
+```bash
+python3 -m kalshi_ingest trades-sample --limit 10
+```
+
+Expected output: trade count, cursor, and a list of sample tickers. If this fails, check your `.env` file.
+
+**3. Verify WebSocket connectivity** — confirms the live stream works:
+
+```bash
+python3 -m kalshi_ws
+```
+
+Watch stderr for `Connected.` and `Subscribed to ticker/trade` messages. After a few seconds, raw JSONL files appear in `data/kalshi/ws/`. Ctrl+C to stop.
+
+**4. Run the full filter** — confirms everything works end-to-end:
+
+```bash
+python3 -m kalshi_filter
+```
+
+Watch for the `FIRST EVAL` line confirming markets are being scanned. After 5+ evaluation cycles (5+ minutes with default 60s interval), any qualifying markets will be promoted to WATCHING. Check `data/kalshi/transitions/` for JSONL transition logs.
+
+### Configuration
+
+All thresholds are in `config.json`. If the file doesn't exist, it's auto-generated with defaults on first run. Key parameters:
+
+| Parameter | Default | What it controls |
+|-----------|---------|-----------------|
+| `tier1.min_spread` | 0.03 | Minimum spread (in dollars) to consider a market |
+| `tier1.max_spread` | 0.40 | Maximum spread — too wide means illiquid |
+| `tier1.max_confidence_threshold` | 0.95 | Max bid before market is "decided YES" |
+| `tier1.min_confidence_threshold` | 0.05 | Min ask before market is "decided NO" |
+| `tier1.min_dollar_volume` | 100 | Minimum dollar volume |
+| `tier1.min_update_rate` | 1.0 | Minimum updates per minute |
+| `tier1.min_expiry_seconds` | 1800 | Minimum time to expiry (30 min) |
+| `tier1.max_imbalance_deviation` | 0.35 | Max deviation from 50/50 yes/no ratio |
+| `tier1.consecutive_passes_required` | 5 | Passes needed before promotion |
+| `tier1.consecutive_fails_allowed` | 3 | Fails before demotion |
+| `cooldowns.first_demotion_seconds` | 900 | First cooldown (15 min) |
+| `cooldowns.second_demotion_seconds` | 7200 | Second cooldown (2 hours) |
+| `cooldowns.max_demotions_before_blacklist` | 3 | Demotions before permanent blacklist |
+| `evaluation.interval_seconds` | 60 | Seconds between evaluation cycles |
+| `metadata.refresh_interval_seconds` | 300 | Seconds between REST metadata refreshes |
 
 ## Task List
 
@@ -149,52 +304,21 @@ Ordered by dependency. Each task builds on what comes before it.
 
 ---
 
-### Task 1: REST Metadata Bootstrap
+### ~~Task 1: REST Metadata Bootstrap~~ ✅ DONE
 
-**Depends on:** nothing (`kalshi_ingest/` already exists)
-
-**Purpose:** On startup, pull all active markets via REST so the system knows expiration times, event tickers, and market status before the WebSocket stream begins.
-
-**Inputs:** Kalshi REST API via existing `ingest_markets(status="open")`
-
-**Outputs:** `Dict[str, MarketMetadata]` in memory — ticker, expiration\_time, status, event\_ticker, result for every active market
-
-**Key details:**
-- Run once at startup before the WebSocket connects
-- Re-run every ~5 minutes in the background to catch newly listed or settled markets
-- Must not block the async WebSocket loop (use `asyncio.to_thread` to wrap the sync REST calls)
-- `MarketMetadata` is a new dataclass separate from `MarketTicker` — it holds static/slow-changing fields from the REST API, while `MarketTicker` holds fast-changing fields from the WebSocket
+Implemented in `kalshi_filter/metadata.py`. Pulls all active markets via REST at startup and refreshes every 5 minutes. Wrapped in `asyncio.to_thread` so it doesn't block the event loop.
 
 ---
 
-### Task 2: Tier 1 Filter
+### ~~Task 2: Tier 1 Filter~~ ✅ DONE
 
-**Depends on:** Task 1, `kalshi_ws/` (built)
-
-**Purpose:** Continuously evaluate every market using ticker and trade data and identify candidates worth subscribing to orderbook data for.
-
-**Inputs:** `market_states` dict, `trade_buffers` dict, `MarketMetadata` dict
-
-**Outputs:** A live list of candidate tickers that pass all filters
-
-**Key details:**
-- Hard filters (all thresholds from config, nothing hardcoded):
-  - Spread > 3¢ and < 40¢
-  - Market not effectively decided (bid < $0.95 and ask > $0.05)
-  - Time to expiry above minimum
-  - Volume above minimum
-  - Update frequency (update\_count rate) above minimum
-- Flow check: directional imbalance from trade buffer — ratio of yes-taker to no-taker trades. Extreme imbalance = informed flow = skip.
-- Consistency requirement: a market must pass N consecutive evaluations before promotion (avoids flickering)
-- Run evaluation every ~60 seconds
-- Markets previously demoted have escalating cooldowns: 15 min → 2 hours → permanent blacklist
-- All thresholds loaded from the configuration system (Task 10)
+Implemented in `kalshi_filter/filter.py`. Evaluates all markets every 60 seconds against 7 configurable checks. Lifecycle state machine with IGNORED → WATCHING → DEMOTED → BLACKLISTED. Escalating cooldowns.
 
 ---
 
 ### Task 3: Orderbook Subscriber + State Manager
 
-**Depends on:** Task 2
+**Depends on:** Task 2 (done)
 
 **Purpose:** Subscribe to `orderbook_delta` for Tier 1 candidates and maintain a live in-memory orderbook per market.
 
@@ -234,25 +358,21 @@ Ordered by dependency. Each task builds on what comes before it.
 
 ---
 
-### Task 5: Market Lifecycle State Machine
+### Task 5: Market Lifecycle State Machine (QUOTING state)
 
-**Depends on:** Task 2, Task 4
+**Depends on:** Task 2 (done), Task 4
 
-**Purpose:** Manage each market's state transitions with proper hysteresis and cooldowns so the system doesn't flip-flop.
+**Purpose:** Extend the existing lifecycle to include `WATCHING → QUOTING` transitions, driven by Tier 2 analysis results.
 
-**Inputs:** Tier 1 filter output, Tier 2 analysis output, P&L data
+**Inputs:** Tier 1 filter output (done), Tier 2 analysis output, P&L data
 
 **Outputs:** Current status per market, transition events logged with full metric snapshots
 
 **Key details:**
-- States: `IGNORED` → `WATCHING` → `QUOTING` → `DEMOTED`
-- `IGNORED → WATCHING`: market passes Tier 1 filter N consecutive times
+- The IGNORED → WATCHING → DEMOTED → BLACKLISTED states already exist. This task adds the `QUOTING` state.
 - `WATCHING → QUOTING`: warm-up complete + all Tier 2 metrics pass thresholds
 - `QUOTING → DEMOTED`: Tier 2 metrics fail N consecutive times, OR per-market P&L kill switch trips
-- `DEMOTED → IGNORED`: observation window expires, cooldown starts
-- Escalating cooldowns: 15 min → 2 hours → permanent blacklist
-- Quote sizing scales continuously with metrics (e.g., toxicity up → size down) before a hard demotion — gradual degradation, not cliff edges
-- Every transition logged with full metric snapshot for post-session analysis
+- Quote sizing scales continuously with metrics (e.g., toxicity up → size down) before a hard demotion
 
 ---
 
@@ -314,71 +434,22 @@ Ordered by dependency. Each task builds on what comes before it.
 
 ---
 
-### Task 9: Persistence and Logging
+### ~~Task 9: Persistence and Logging~~ 🟡 PARTIAL
 
-**Depends on:** built incrementally alongside Tasks 2–8
-
-**Purpose:** Record everything for post-session analysis, debugging, and threshold tuning.
-
-**Inputs:** All events, metrics, transitions, P&L
-
-**Outputs:** JSONL files (or SQLite, TBD)
-
-**Key details:**
-- Metric snapshots every ~30 seconds per market
-- Every state transition with full context (metrics at time of transition, reason)
-- Every fill with P&L attribution
-- Must not block the trading loop — use async writes or background thread
-- Append-only format, analyzed after session ends
+Raw WS messages and state transitions are logged. Still needed: metric snapshots per market, fill records, P&L attribution.
 
 ---
 
-### Task 10: Configuration System
+### ~~Task 10: Configuration System~~ ✅ DONE
 
-**Depends on:** nothing, but should be built before or alongside Task 2
-
-**Purpose:** Externalize all thresholds, window sizes, and parameters so they can be tuned without code changes.
-
-**Inputs:** YAML or JSON config file
-
-**Outputs:** Typed config object accessible by all components
-
-**Key details:**
-- Tier 1 filter thresholds (spread bounds, volume min, activity min, imbalance max)
-- Tier 2 metric thresholds (toxicity max, fill probability min, autocorrelation bounds, edge min)
-- Warm-up durations, evaluation intervals
-- Cooldown durations and escalation schedule
-- Quote sizing parameters and position limits
-- Kill switch limits (per-market, global)
-- All parameters should have sensible defaults so the system can run without a config file
-
-## Running the System
-
-**Prerequisites:**
-- Python 3.10+
-- Kalshi API key — set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH` in `.env` (see `.env.example`)
-- `pip install -r requirements.txt`
-
-**Current commands:**
-
-```bash
-# Stream all market data in real time (WebSocket)
-python3 -m kalshi_ws
-
-# Batch download: all open markets
-python3 -m kalshi_ingest markets --status open --out-dir data/kalshi
-
-# Batch download: trades for a specific market
-python3 -m kalshi_ingest trades --ticker SOMETICKER --out-dir data/kalshi
-
-# Batch download: orderbook snapshots
-python3 -m kalshi_ingest orderbook --tickers TICK1,TICK2 --out-dir data/kalshi
-```
+Implemented in `kalshi_filter/config.py`. JSON config with typed dataclasses, validation, defaults, and auto-generation.
 
 ## Technical Notes
 
 - The WebSocket module (`kalshi_ws/`) signs the handshake directly rather than using `KalshiAuth.sign()`, because that method prepends `base_url` which produces the wrong path for the WS endpoint (`/trade-api/ws/v2` vs `/trade-api/v2/…`).
 - All WebSocket numeric values arrive as strings and are parsed to floats at the message boundary. Everything downstream works with floats.
-- The REST ingester (`kalshi_ingest/`) is synchronous. The WebSocket module (`kalshi_ws/`) is async. They coexist as separate packages and don't share a runtime.
+- The REST ingester (`kalshi_ingest/`) is synchronous. The WebSocket module (`kalshi_ws/`) and filter (`kalshi_filter/`) are async. The metadata bootstrap wraps sync REST calls in `asyncio.to_thread`.
+- The Tier 1 filter's activity rate is computed as the change in `update_count` between consecutive evaluations, divided by elapsed minutes. The first evaluation for any market skips the activity check (no baseline).
+- Markets without REST metadata (new markets not yet fetched) are skipped entirely during evaluation — no pass or fail counted. They're picked up after the next metadata refresh.
 - Orderbook deltas are additive: `delta_fp` is added to the current quantity at that price level. If the result is zero or negative, remove the level entirely.
 - The `seq` field on orderbook messages must be tracked per subscription ID. A gap in sequence numbers means a missed message and requires resubscribing to get a fresh snapshot.

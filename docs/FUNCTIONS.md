@@ -1,6 +1,8 @@
 ## Function reference
 
-This document describes the main functions/classes exposed by the package and what they return.
+This document describes the main functions/classes exposed by each package and what they return.
+
+---
 
 ### `kalshi_ingest.auth`
 
@@ -24,6 +26,7 @@ This document describes the main functions/classes exposed by the package and wh
   - `method`: HTTP method (e.g. `GET`)
   - `endpoint_path`: endpoint path relative to `base_url` (e.g. `/markets`)
 - **Returns**: base64-encoded signature string.
+- **Note**: This method prepends `base_url` to the path before signing. For the WebSocket endpoint (`/trade-api/ws/v2`), this produces the wrong path. `kalshi_ws` signs directly instead.
 
 ### `kalshi_ingest.client`
 
@@ -72,6 +75,7 @@ This document describes the main functions/classes exposed by the package and wh
   - `markets_raw_<timestamp>.jsonl`
   - `markets_flat_<timestamp>.csv` (or a `.txt` note if CSV write fails)
 - **Filters** (optional): `status`, `series_ticker`, `event_ticker`, `tickers`
+- **Used by**: `kalshi_filter/metadata.py` calls this with `status="open"` to bootstrap market metadata.
 
 #### `ingest_trades(client: KalshiClient, out_dir: str | Path, ...) -> IngestResult`
 - **Purpose**: Download all pages from `GET /markets/trades`, save raw JSONL and flattened CSV.
@@ -108,3 +112,173 @@ This document describes the main functions/classes exposed by the package and wh
 - **Purpose**: Parse CLI args and run a subcommand (`markets`, `trades`, `trades-sample`, `orderbook`).
 - **Returns**: process exit code.
 
+---
+
+### `kalshi_ws.models`
+
+#### `MarketTicker`
+- **Purpose**: In-memory representation of a market's latest ticker state from the WebSocket.
+- **Fields**:
+  - `market_ticker: str` — unique market identifier
+  - `yes_bid: float` — best bid price (parsed from `yes_bid_dollars` string)
+  - `yes_ask: float` — best ask price (parsed from `yes_ask_dollars` string)
+  - `spread: float` — derived: `yes_ask - yes_bid`
+  - `last_price: float` — last traded price
+  - `volume: float` — total contracts traded
+  - `open_interest: float` — open interest
+  - `dollar_volume: int` — total dollar volume
+  - `dollar_open_interest: int` — dollar open interest
+  - `last_update_ts: int` — unix timestamp of last update
+  - `update_count: int` — incremented on every ticker update (useful for activity measurement)
+- **Class methods**:
+  - `from_msg(msg: dict) -> MarketTicker` — construct from a raw WS ticker message
+- **Instance methods**:
+  - `update(msg: dict) -> None` — merge a partial ticker update, recalculate spread
+
+#### `Trade`
+- **Purpose**: A single trade from the WebSocket trade channel.
+- **Fields**:
+  - `trade_id: str`, `market_ticker: str`
+  - `yes_price: float`, `no_price: float` — parsed from dollar strings
+  - `size: float` — contracts traded (parsed from `count_fp` string)
+  - `taker_side: str` — `"yes"` or `"no"`
+  - `ts: int` — unix timestamp
+- **Class methods**:
+  - `from_msg(msg: dict) -> Trade` — construct from a raw WS trade message
+
+#### `_parse_float(val) -> float`
+- **Purpose**: Parse a value that may be a string, int, or float to float. Returns `0.0` for unrecognized types.
+- **Used at**: the message boundary to convert all WS numeric strings.
+
+### `kalshi_ws.stream`
+
+#### `run_ws_stream(base_url: str | None, out_dir: str, trade_buffer_size: int) -> None`
+- **Purpose**: Main async entry point. Connects to Kalshi WS, subscribes to ticker + trade channels, processes messages indefinitely.
+- **Parameters**:
+  - `base_url`: WebSocket URL or REST base URL. Falls back to `KALSHI_BASE_URL` env var.
+  - `out_dir`: directory for raw JSONL stream files (default `data/kalshi/ws`)
+  - `trade_buffer_size`: max trades per market in memory (default 5000)
+- **Behavior**: Reconnects with exponential backoff (1s → 60s cap). Resubscribes on reconnect.
+- **Used by**: `kalshi_filter/__main__.py` starts this as an `asyncio.create_task`.
+
+#### `get_market_states() -> Dict[str, MarketTicker]`
+- **Purpose**: Return the live market-state dict. Updated on every ticker message.
+- **Thread safety**: Read-only by convention. Single writer (WS message loop), multiple readers (filter, analysis).
+
+#### `get_trade_buffer(market_ticker: str) -> deque[Trade]`
+- **Purpose**: Return the trade deque for a given market. Empty deque if the market hasn't been seen.
+- **Max length**: Configurable via `trade_buffer_size` (default 5000).
+
+#### `get_subscription_ids() -> Dict[str, int]`
+- **Purpose**: Return the mapping of channel name → server-assigned subscription ID (sid).
+- **Used later**: For `update_subscription` commands when adding/removing orderbook tickers.
+
+---
+
+### `kalshi_filter.config`
+
+#### `load_config(path: str | Path = "config.json") -> Config`
+- **Purpose**: Load configuration from a JSON file into typed dataclasses.
+- **Behavior**:
+  - File missing → use all defaults, write default config file for reference
+  - Key missing → use default for that key, log a warning
+  - Wrong type → raise `TypeError` immediately with a clear message
+- **Returns**: `Config` with sections: `tier1`, `cooldowns`, `evaluation`, `metadata`, `websocket`, `paths`
+
+#### `write_default_config(path: str | Path = "config.json") -> None`
+- **Purpose**: Write a JSON file containing all default parameter values.
+
+#### `config_summary(cfg: Config) -> str`
+- **Purpose**: Return a human-readable multi-line string of all config values (for startup logging).
+
+#### Config dataclasses
+
+| Class | Key fields |
+|-------|-----------|
+| `Tier1Config` | `min_spread`, `max_spread`, `max_confidence_threshold`, `min_confidence_threshold`, `min_dollar_volume`, `min_update_rate`, `min_expiry_seconds`, `max_imbalance_deviation`, `min_trades_for_imbalance`, `consecutive_passes_required`, `consecutive_fails_allowed` |
+| `CooldownConfig` | `first_demotion_seconds`, `second_demotion_seconds`, `max_demotions_before_blacklist` |
+| `EvalConfig` | `interval_seconds` |
+| `MetadataConfig` | `refresh_interval_seconds` |
+| `WebSocketConfig` | `trade_buffer_size` |
+| `PathsConfig` | `ws_out_dir`, `transition_log_dir`, `metadata_out_dir` |
+
+### `kalshi_filter.metadata`
+
+#### `MarketMetadata`
+- **Purpose**: Static/slow-changing market info from the REST API. Separate from `MarketTicker` (fast-changing WS data).
+- **Fields**:
+  - `ticker: str` — market identifier
+  - `expiration_time: float` — unix timestamp of market expiration
+  - `status: str` — `"open"`, `"closed"`, `"settled"`, etc.
+  - `event_ticker: str` — parent event identifier
+  - `result: str` — empty string if unresolved, `"yes"`/`"no"` if settled
+  - `close_time: float` — unix timestamp of market close
+- **Class methods**:
+  - `from_api_dict(d: dict) -> MarketMetadata` — construct from a raw Kalshi API market dict (parses ISO timestamps to unix floats)
+
+#### `refresh_metadata(config: Config) -> int`
+- **Purpose**: Fetch all open markets via REST (in a background thread), replace the global metadata dict.
+- **Returns**: Number of markets loaded.
+- **Async**: Yes — wraps sync `ingest_markets` in `asyncio.to_thread`.
+
+#### `get_market_metadata() -> Dict[str, MarketMetadata]`
+- **Purpose**: Return the full metadata dict (read-only by convention).
+
+#### `get_metadata(ticker: str) -> Optional[MarketMetadata]`
+- **Purpose**: Return metadata for a single ticker, or `None` if not in the dict.
+
+### `kalshi_filter.filter`
+
+#### `MarketTracker`
+- **Purpose**: Per-market lifecycle tracking state.
+- **Fields**:
+  - `ticker: str`, `status: str` — one of `IGNORED`, `WATCHING`, `DEMOTED`, `BLACKLISTED`
+  - `consecutive_passes: int`, `consecutive_fails: int`
+  - `demoted_at: float | None`, `demotion_count: int`, `cooldown_until: float | None`
+  - `last_eval_result: str`, `last_eval_time: float`, `promoted_at: float | None`
+  - `prev_update_count: int`, `prev_eval_time: float` — for computing update rate between evals
+
+#### `evaluate_market(market_state, trade_buffer, metadata, config, update_rate, now) -> tuple[bool, str]`
+- **Purpose**: Evaluate a single market against all Tier 1 criteria. Pure logic, no side effects.
+- **Returns**: `(True, "PASS")` or `(False, "reason string")`
+- **Checks** (in order):
+  1. No quotes (bid=0 or ask=0)
+  2. Spread bounds
+  3. Decided (bid too high or ask too low)
+  4. Expiry (skipped if no metadata)
+  5. Volume
+  6. Activity (skipped if no rate available — first eval)
+  7. Imbalance (skipped if fewer trades than `min_trades_for_imbalance`)
+
+#### `run_evaluation(config: Config, on_transition=None) -> dict`
+- **Purpose**: Run one full evaluation cycle across all markets in `market_states`.
+- **Parameters**:
+  - `on_transition`: optional callback `(ticker, old_status, new_status, tracker, metrics)` — called on every status change
+- **Returns**: Summary dict `{"total": N, "IGNORED": N, "WATCHING": N, "DEMOTED": N, "BLACKLISTED": N}`
+- **Side effects**: Updates the global `_trackers` dict.
+
+#### `compute_metrics(market_state, trade_buffer, metadata, update_rate, now) -> dict`
+- **Purpose**: Build a summary metrics dict for transition logging.
+- **Returns**: Dict with keys `spread`, `dollar_volume`, `yes_bid`, `yes_ask`, `imbalance`, `update_rate`, `time_to_expiry`.
+
+#### `get_candidates() -> List[str]`
+- **Purpose**: Return tickers with status `WATCHING` — these are the Tier 1 candidates.
+
+#### `get_market_status(ticker: str) -> Optional[str]`
+- **Purpose**: Return the lifecycle status for a ticker.
+
+#### `get_all_trackers() -> Dict[str, MarketTracker]`
+- **Purpose**: Return the full tracker dict (for debugging/logging).
+
+### `kalshi_filter.transitions`
+
+#### `TransitionLogger(log_dir: str | Path)`
+- **Purpose**: Logs market status transitions to console (formatted) and to a daily JSONL file.
+- **File**: `{log_dir}/transitions_YYYYMMDD.jsonl`
+
+#### `TransitionLogger.log_transition(ticker, old_status, new_status, tracker, metrics) -> None`
+- **Purpose**: Log a single status change. Prints formatted line to console, appends JSONL record to disk (via `asyncio.to_thread`).
+- **JSONL record fields**: `ts`, `ticker`, `old_status`, `new_status`, `consecutive_passes`, `demotion_count`, `metrics`
+
+#### `TransitionLogger.log_eval_summary(summary: dict) -> None`
+- **Purpose**: Print end-of-cycle summary. Example: `EVAL: 347 markets | 12 WATCHING | 3 DEMOTED | 2 BLACKLISTED | 330 IGNORED`
