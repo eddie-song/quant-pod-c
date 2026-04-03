@@ -69,6 +69,13 @@ Persistence                                           🟡 PARTIAL
 
 ## What Exists Today
 
+### Configuration (`.env`)
+
+- **Repository root:** Put your `.env` in the project root next to `README.md` (copy from `.env.example`). Required for most commands: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`, and optionally `KALSHI_BASE_URL` (demo vs prod REST/WS URL derivation).
+- **`kalshi_ws`:** `python -m kalshi_ws` loads environment variables with `python-dotenv` from a `.env` file in the **current working directory** only. Run it from the repo root (`cd` into `quant-pod-c/`) so the root `.env` is found, or export the variables in your shell.
+- **`kalshi_ingest`:** Supports `--env-file PATH` if you prefer to keep credentials in another location (for example `kalshi_ingest/.env`).
+- **`KALSHI_PRIVATE_KEY_PATH`:** Interpreted relative to the **process working directory** unless you use an absolute path. If the key file lives in the repo root, run commands from the repo root or set an absolute path.
+
 ### `kalshi_ingest/` — REST Data Ingester
 
 Batch CLI tool for pulling data from Kalshi's REST API. All commands write raw JSONL (every API response) and flattened CSV (one row per record) to the output directory.
@@ -135,6 +142,23 @@ states = get_market_states()           # Dict[str, MarketTicker]
 trades = get_trade_buffer("KXBTC-…")   # deque[Trade]
 sids   = get_subscription_ids()        # {"ticker": 1, "trade": 2}
 ```
+
+---
+
+### `ws_dashboard/` — Live trades dashboard (Streamlit)
+
+Optional UI that reads the same JSONL files the websocket writer produces (it does not open a second WebSocket connection).
+
+- **Input:** `trade_stream_YYYYMMDD.jsonl` under `KALSHI_WS_OUT_DIR` (default `data/kalshi/ws`). Optionally uses `ticker_stream_*.jsonl` for the status panel.
+- **What it shows:** Recent trades (newest first), top markets by trade count, and a **WebSocket status** strip (Receiving vs Stale) based on how recently those files were written.
+- **Run** (from repo root, after `pip install -r requirements.txt`):
+
+```bash
+streamlit run ws_dashboard/app.py
+```
+
+- **Stop:** `Ctrl+C` in the terminal where Streamlit is running.
+- **Typical workflow:** Terminal 1 — `python3 -m kalshi_ws` (or `python -m kalshi_ws` on Windows). Terminal 2 — `streamlit run ws_dashboard/app.py`. Point both at the same output directory via `KALSHI_WS_OUT_DIR` if you override the default.
 
 ---
 
@@ -356,14 +380,19 @@ Ordered by dependency. Each task builds on what comes before it.
 
 **Prerequisites:**
 - Python 3.10+
-- Kalshi API key — set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH` in `.env` (see `.env.example`)
+- Kalshi API key — set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH` in a **repo-root** `.env` (see `.env.example` and the **Configuration (`.env`)** subsection under **What Exists Today**)
 - `pip install -r requirements.txt`
+
+On Windows, use `python` instead of `python3` if that is what your install provides.
 
 **Current commands:**
 
 ```bash
-# Stream all market data in real time (WebSocket)
+# Stream all market data in real time (WebSocket); run from repo root so .env loads
 python3 -m kalshi_ws
+
+# Live trades dashboard (optional; requires websocket writing JSONL to disk)
+streamlit run ws_dashboard/app.py
 
 # Batch download: all open markets
 python3 -m kalshi_ingest markets --status open --out-dir data/kalshi
@@ -375,10 +404,13 @@ python3 -m kalshi_ingest trades --ticker SOMETICKER --out-dir data/kalshi
 python3 -m kalshi_ingest orderbook --tickers TICK1,TICK2 --out-dir data/kalshi
 ```
 
+**Verify the websocket is receiving data:** Check that `data/kalshi/ws/ticker_stream_YYYYMMDD.jsonl` and `trade_stream_YYYYMMDD.jsonl` grow while `kalshi_ws` is running. Logs show connect/subscribe; per-message output goes to those files, not stdout.
+
 ## Technical Notes
 
 - The WebSocket module (`kalshi_ws/`) signs the handshake directly rather than using `KalshiAuth.sign()`, because that method prepends `base_url` which produces the wrong path for the WS endpoint (`/trade-api/ws/v2` vs `/trade-api/v2/…`).
 - All WebSocket numeric values arrive as strings and are parsed to floats at the message boundary. Everything downstream works with floats.
 - The REST ingester (`kalshi_ingest/`) is synchronous. The WebSocket module (`kalshi_ws/`) is async. They coexist as separate packages and don't share a runtime.
+- The Streamlit app (`ws_dashboard/app.py`) adds the repository root to `sys.path` so `kalshi_ws` models import reliably; running `streamlit run ws_dashboard/app.py` from the repo root is still recommended.
 - Orderbook deltas are additive: `delta_fp` is added to the current quantity at that price level. If the result is zero or negative, remove the level entirely.
 - The `seq` field on orderbook messages must be tracked per subscription ID. A gap in sequence numbers means a missed message and requires resubscribing to get a fresh snapshot.

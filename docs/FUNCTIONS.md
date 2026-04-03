@@ -108,3 +108,23 @@ This document describes the main functions/classes exposed by the package and wh
 - **Purpose**: Parse CLI args and run a subcommand (`markets`, `trades`, `trades-sample`, `orderbook`).
 - **Returns**: process exit code.
 
+### `kalshi_ws`
+
+#### `run_ws_stream(base_url=None, out_dir="data/kalshi/ws", trade_buffer_size=5000) -> None` (`kalshi_ws.stream`)
+- **Purpose**: Connect to Kalshi WebSocket, subscribe to `ticker` and `trade` channels, update in-memory state, append raw lines to daily JSONL under `out_dir`, reconnect with exponential backoff.
+- **CLI**: `python -m kalshi_ws` (`kalshi_ws/__main__.py` loads `.env` from cwd, reads `KALSHI_WS_URL`, `KALSHI_WS_OUT_DIR`, `KALSHI_WS_TRADE_BUFFER`).
+- **Auth**: Uses `KalshiAuth.from_env()`; signing uses path `/trade-api/ws/v2` (see `README.md` Technical Notes).
+
+#### `get_market_states() / get_trade_buffer(ticker) / get_subscription_ids()` (`kalshi_ws.stream`)
+- **Purpose**: Read live in-memory state populated by the running stream (same process).
+
+#### `MarketTicker` / `Trade` (`kalshi_ws.models`)
+- **Purpose**: Parse WebSocket `msg` dicts; numeric fields may arrive as strings.
+
+### `ws_dashboard`
+
+#### Streamlit app (`ws_dashboard/app.py`)
+- **Purpose**: Tail `trade_stream_*.jsonl` (and check `ticker_stream_*.jsonl` for status) under `KALSHI_WS_OUT_DIR`, display recent trades and a Receiving/Stale status based on file write times.
+- **Run**: `streamlit run ws_dashboard/app.py` from repo root; stop with `Ctrl+C`.
+- **Requires**: `kalshi_ws` running separately (or existing JSONL files) for ongoing updates.
+
