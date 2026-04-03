@@ -128,3 +128,20 @@ This document describes the main functions/classes exposed by the package and wh
 - **Run**: `streamlit run ws_dashboard/app.py` from repo root; stop with `Ctrl+C`.
 - **Requires**: `kalshi_ws` running separately (or existing JSONL files) for ongoing updates.
 
+### `kalshi_as`
+
+#### `compute_quotes(...)`, `ASConfig` (`kalshi_as.model`)
+- **Purpose**: Reduced-form Avellaneda–Stoikov bid/ask around reservation; Kalshi tick rounding and clamp to valid YES prices.
+
+#### `run_as_strategy_loop(...)` (`kalshi_as.strategy_loop`)
+- **Purpose**: Async loop calling `get_market_states()` on an interval; maintains per-ticker mid history; estimates σ; logs quotes.
+
+#### `main()` (`kalshi_as.__main__`)
+- **Purpose**: `asyncio.gather(run_ws_stream(), run_as_strategy_loop())` with CLI flags.
+
+#### `estimate_sigma_per_sqrt_hour(...)` (`kalshi_as.sigma`)
+- **Purpose**: Scale log-return stdev of mids to a rough per-√hour σ from the sampling interval.
+
+#### `build_sample_order_record` / `append_records_jsonl` (`kalshi_as.sample_orders`)
+- **Purpose**: Build JSON objects for hypothetical BUY YES / SELL YES limits at the model bid/ask and append to a JSONL file (no API calls).
+

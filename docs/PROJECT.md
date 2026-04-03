@@ -19,6 +19,7 @@
 | `.env.example` | Template for API key and key file path |
 | `kalshi_ingest/` | Code: auth, client, ingest, CLI |
 | `kalshi_ws/` | Async WebSocket client; ticker + trade streams; JSONL persistence |
+| `kalshi_as/` | Avellaneda–Stoikov quote monitor running alongside `kalshi_ws` (no orders) |
 | `ws_dashboard/` | Streamlit UI for live trades (reads JSONL written by `kalshi_ws`) |
 | `docs/` | This doc and the function reference |
 
@@ -102,4 +103,6 @@ streamlit run ws_dashboard/app.py
 ```
 
 Stop Streamlit with `Ctrl+C`. The dashboard reads the same JSONL files; keep `kalshi_ws` running in another terminal for live updates. See `README.md` for full details.
+
+**Avellaneda–Stoikov (monitor):** `python -m kalshi_as` runs the websocket and a periodic loop that logs theoretical quotes from live mids (see `README.md`).
 

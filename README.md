@@ -145,12 +145,48 @@ sids   = get_subscription_ids()        # {"ticker": 1, "trade": 2}
 
 ---
 
+### `kalshi_as/` — Avellaneda–Stoikov (monitor only)
+
+Reduced-form **Avellaneda–Stoikov** quotes from live websocket state: reservation price (inventory skew) plus symmetric half-spread from \((\gamma, k, \sigma, \tau)\). Volatility **σ** is estimated from a rolling window of YES mids sampled each cycle.
+
+- **Does not place orders** — logs theoretical bid/ask for the widest-spread liquid markets (CLI filters).
+- **Same process as the socket:** `asyncio.gather` runs `run_ws_stream()` and the strategy loop; inventory is manual (`--inventory`) until a fill channel exists.
+- **Sample “orders” (hypothetical):** With `--sample-contracts N`, each cycle appends one JSON line per quoted market to `data/kalshi/as_sample_orders.jsonl` (override with `--sample-orders-file` or `KALSHI_AS_SAMPLE_ORDERS`), describing **post_limit_buy_yes @ model bid** and **post_limit_sell_yes @ model ask** for `N` contracts. These are **not** sent to Kalshi’s API.
+
+**Run** (repo root, same `.env` as `kalshi_ws`):
+
+```bash
+python3 -m kalshi_as --interval 5 --gamma 0.05 --k 1.5 --tau-hours 4 --min-spread 0.03
+```
+
+With hypothetical limit intents logged to JSONL:
+
+```bash
+python3 -m kalshi_as --interval 5 --sample-contracts 10 --sample-orders-file data/kalshi/as_sample_orders.jsonl
+```
+
+Useful flags: `--max-markets`, `--mid-history`, `--sigma-min-samples`, `--inventory` (YES contracts; positive = long YES).
+
+**Theory vs this implementation:** The code uses a standard **reduced symmetric** AS recipe (reservation skew + closed-form half-spread from **γ**, **k**, **σ**, and horizon **τ**). It is **not** a full calibration to Kalshi’s fee schedule, actual fill intensities, or every limiting case in the original paper—and **σ** is estimated from coarse ticker mids, so results are **illustrative** until you fit parameters to your data. Binary YES prices in **[0, 1]** also differ from classical unbounded-mid assumptions.
+
+**Library use:**
+
+```python
+from kalshi_as import ASConfig, compute_quotes
+
+cfg = ASConfig(gamma=0.05, k=1.5, tau_hours=4.0, tick=0.01)
+q = compute_quotes(0.55, inventory_yes=0.0, sigma=0.12, config=cfg)
+# q.bid, q.ask, q.reservation, q.half_spread
+```
+
+---
+
 ### `ws_dashboard/` — Live trades dashboard (Streamlit)
 
 Optional UI that reads the same JSONL files the websocket writer produces (it does not open a second WebSocket connection).
 
-- **Input:** `trade_stream_YYYYMMDD.jsonl` under `KALSHI_WS_OUT_DIR` (default `data/kalshi/ws`). Optionally uses `ticker_stream_*.jsonl` for the status panel.
-- **What it shows:** Recent trades (newest first), top markets by trade count, and a **WebSocket status** strip (Receiving vs Stale) based on how recently those files were written.
+- **Input:** `trade_stream_YYYYMMDD.jsonl` under `KALSHI_WS_OUT_DIR` (default `data/kalshi/ws`). Optionally uses `ticker_stream_*.jsonl` for the status panel. **Avellaneda–Stoikov sample intents:** tails `data/kalshi/as_sample_orders.jsonl` by default, or set the sidebar path / env `KALSHI_AS_SAMPLE_ORDERS` (produced by `kalshi_as --sample-contracts`).
+- **What it shows:** **WebSocket status**, **hypothetical AS orders** (book, mid, reservation, model bid/ask, σ, γ, k, τ, inventory, spread, **gross_profit_if_both_fill**), recent exchange trades, and top markets.
 - **Run** (from repo root, after `pip install -r requirements.txt`):
 
 ```bash
@@ -158,14 +194,15 @@ streamlit run ws_dashboard/app.py
 ```
 
 - **Stop:** `Ctrl+C` in the terminal where Streamlit is running.
-- **Typical workflow:** Terminal 1 — `python3 -m kalshi_ws` (or `python -m kalshi_ws` on Windows). Terminal 2 — `streamlit run ws_dashboard/app.py`. Point both at the same output directory via `KALSHI_WS_OUT_DIR` if you override the default.
+- **Typical workflow:** See **Running the System → Run everything** for websocket + AS + dashboard. `kalshi_as` already includes the websocket and can feed the AS sample-orders file used by the dashboard.
 
 ---
 
 ### Tests
 
 - 8 unit tests covering WebSocket data model parsing, string-to-float conversion, spread derivation, partial updates, and deque bounds
-- Run: `python3 -m pytest tests/test_ws_models.py -v`
+- Additional tests for Avellaneda–Stoikov math and volatility estimation
+- Run: `python3 -m pytest tests/ -v` (or `tests/test_ws_models.py` / `tests/test_avellaneda_stoikov.py` only)
 
 ## Task List
 
@@ -394,6 +431,9 @@ python3 -m kalshi_ws
 # Live trades dashboard (optional; requires websocket writing JSONL to disk)
 streamlit run ws_dashboard/app.py
 
+# WebSocket + Avellaneda–Stoikov quote monitor (no order placement)
+python3 -m kalshi_as --interval 5
+
 # Batch download: all open markets
 python3 -m kalshi_ingest markets --status open --out-dir data/kalshi
 
@@ -405,6 +445,35 @@ python3 -m kalshi_ingest orderbook --tickers TICK1,TICK2 --out-dir data/kalshi
 ```
 
 **Verify the websocket is receiving data:** Check that `data/kalshi/ws/ticker_stream_YYYYMMDD.jsonl` and `trade_stream_YYYYMMDD.jsonl` grow while `kalshi_ws` is running. Logs show connect/subscribe; per-message output goes to those files, not stdout.
+
+### Run everything (websocket + AS sample orders + dashboard)
+
+Use **two** terminals, both with `cd` to the repo root so `.env` loads.
+
+**Terminal 1 — stream market data and append hypothetical AS orders to JSONL:**
+
+```bash
+python -m kalshi_as --interval 5 --sample-contracts 10 --min-spread 0.02
+```
+
+(On Windows, `python` is fine; on macOS/Linux you can use `python3`.)
+
+This runs the WebSocket and the Avellaneda–Stoikov loop in one process. It writes:
+
+- `data/kalshi/ws/ticker_stream_*.jsonl` and `trade_stream_*.jsonl`
+- `data/kalshi/as_sample_orders.jsonl` (Override with `--sample-orders-file` or `KALSHI_AS_SAMPLE_ORDERS`.)
+
+**Terminal 2 — dashboard (live trades + AS table with gross spread profit):**
+
+```bash
+streamlit run ws_dashboard/app.py
+```
+
+Open the URL Streamlit prints (e.g. `http://localhost:8501`). The **Avellaneda–Stoikov sample orders** section shows each hypothetical market with **gross_profit_if_both_fill** = **(model ask − model bid) × contracts** if both legs filled at those limits (no fees; not realized P&L).
+
+**Stop:** `Ctrl+C` in each terminal.
+
+**Alternative (dashboard + websocket only, no AS file):** Terminal 1: `python -m kalshi_ws`. You will see exchange trades in the UI but not the AS sample-order rows until you run `kalshi_as` with `--sample-contracts` or another writer for `as_sample_orders.jsonl`.
 
 ## Technical Notes
 
