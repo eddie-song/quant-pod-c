@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from .auth import KalshiAuth
 from .client import KalshiClient
-from .ingest import fetch_trades_sample, ingest_markets, ingest_trades
+from .ingest import fetch_trades_sample, ingest_markets, ingest_orderbook, ingest_trades
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -39,6 +39,21 @@ def cmd_trades(args: argparse.Namespace) -> int:
         min_ts=args.min_ts,
         max_ts=args.max_ts,
         limit=args.limit,
+    )
+    print(res)
+    return 0
+
+
+def cmd_orderbook(args: argparse.Namespace) -> int:
+    tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+    if not tickers:
+        print("Error: --tickers must provide at least one ticker.")
+        return 1
+    res = ingest_orderbook(
+        _client_from_env(args.env_file),
+        args.out_dir,
+        tickers,
+        depth=args.depth,
     )
     print(res)
     return 0
@@ -97,6 +112,12 @@ def main() -> int:
     _add_common(p_sample)
     p_sample.add_argument("--limit", type=int, default=100, help="Page size (1-1000).")
     p_sample.set_defaults(func=cmd_trades_sample)
+
+    p_orderbook = sub.add_parser("orderbook", help="Download orderbook snapshots (GET /markets/{ticker}/orderbook).")
+    _add_common(p_orderbook)
+    p_orderbook.add_argument("--tickers", required=True, help="Comma-separated list of market tickers.")
+    p_orderbook.add_argument("--depth", type=int, default=None, help="Number of price levels per side (omit for full depth).")
+    p_orderbook.set_defaults(func=cmd_orderbook)
 
     args = parser.parse_args()
     return args.func(args)
