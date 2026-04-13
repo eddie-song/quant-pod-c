@@ -77,6 +77,7 @@ async def run_as_strategy_loop(
                 buf,
                 sample_interval_s=interval_s,
                 min_samples=sigma_min_samples,
+                ewma_alpha=0.25,
             )
             if sigma is None:
                 continue
