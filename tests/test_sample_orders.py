@@ -5,7 +5,7 @@ from kalshi_as.sample_orders import build_sample_order_record
 
 
 def test_build_sample_order_record_shape():
-    cfg = ASConfig(gamma=0.05, k=2.0, tau_hours=1.0, tick=0.01)
+    cfg = ASConfig(gamma=0.05, k=2.0, tau_hours=1.0, A=1.2, tick=0.01)
     q = compute_quotes(0.5, inventory_yes=0.0, sigma=0.1, config=cfg)
     r = build_sample_order_record(
         market_ticker="KXTEST-YES",

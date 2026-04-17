@@ -11,6 +11,7 @@ class ASConfig:
     gamma: float  # risk aversion (> 0)
     k: float  # order-arrival intensity shape (> 0); larger k → tighter theoretical spread
     tau_hours: float  # remaining horizon (T − t) in hours (> 0)
+    A: float = 1.0  # calibration parameter placeholder (stored/logged; formula unchanged for now)
     tick: float = 0.01  # Kalshi YES price tick in dollars
 
 
@@ -49,17 +50,19 @@ def compute_quotes(
     inventory_yes: float,
     sigma: float,
     config: ASConfig,
+    tau_hours: float | None = None,
 ) -> AvellanedaStoikovQuotes:
     """Bid/ask around reservation with symmetric half-spread; clamp to [tick, 1 - tick]."""
     if not (0 < mid < 1):
         raise ValueError("mid must be in (0, 1) for Kalshi YES prices")
     if sigma <= 0:
         raise ValueError("sigma must be positive")
-    if config.tau_hours <= 0:
+    tau = float(config.tau_hours if tau_hours is None else tau_hours)
+    if tau <= 0:
         raise ValueError("tau_hours must be positive")
 
-    v = reservation_price(mid, inventory_yes, config.gamma, sigma, config.tau_hours)
-    h = optimal_half_spread(config.gamma, config.k, sigma, config.tau_hours)
+    v = reservation_price(mid, inventory_yes, config.gamma, sigma, tau)
+    h = optimal_half_spread(config.gamma, config.k, sigma, tau)
     bid_raw = v - h
     ask_raw = v + h
 
