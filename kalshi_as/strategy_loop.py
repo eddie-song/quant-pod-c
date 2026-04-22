@@ -9,6 +9,7 @@ from typing import Any, Deque, Dict, List, Optional
 from kalshi_ws.models import MarketTicker
 from kalshi_ws.stream import get_market_states
 
+from .inventory import get_inventory_state
 from .model import ASConfig, compute_quotes
 from .sample_orders import append_records_jsonl, build_sample_order_record
 from .sigma import estimate_sigma_per_sqrt_hour
@@ -29,6 +30,7 @@ async def run_as_strategy_loop(
     interval_s: float,
     config: ASConfig,
     inventory_yes: float = 0.0,
+    use_live_inventory: bool = True,
     min_spread: float = 0.0,
     max_markets: int = 12,
     mid_history_len: int = 80,
@@ -38,6 +40,7 @@ async def run_as_strategy_loop(
 ) -> None:
     """Periodically compute AS quotes from live `get_market_states()` (websocket must run)."""
     history: Dict[str, Deque[float]] = {}
+    inventory_state = get_inventory_state()
     out_path = sample_orders_path or os.getenv("KALSHI_AS_SAMPLE_ORDERS", "data/kalshi/as_sample_orders.jsonl")
     while True:
         await asyncio.sleep(interval_s)
@@ -83,9 +86,10 @@ async def run_as_strategy_loop(
                 continue
 
             try:
+                inventory_for_ticker = inventory_state.get_position(ticker, inventory_yes) if use_live_inventory else inventory_yes
                 q = compute_quotes(
                     m,
-                    inventory_yes=inventory_yes,
+                    inventory_yes=inventory_for_ticker,
                     sigma=sigma,
                     config=config,
                 )
@@ -94,7 +98,7 @@ async def run_as_strategy_loop(
 
             line = (
                 f"{ticker} mid={m:.4f} σ≈{sigma:.3f} book={mt.yes_bid:.2f}/{mt.yes_ask:.2f} "
-                f"r={q.reservation:.4f} bid={q.bid:.2f} ask={q.ask:.2f} (γ={config.gamma}, k={config.k}, τ={config.tau_hours}h)"
+                f"q={inventory_for_ticker:.2f} r={q.reservation:.4f} bid={q.bid:.2f} ask={q.ask:.2f} (γ={config.gamma}, k={config.k}, τ={config.tau_hours}h)"
             )
             if sample_contracts_per_side > 0:
                 n = sample_contracts_per_side
@@ -110,7 +114,7 @@ async def run_as_strategy_loop(
                         gamma=config.gamma,
                         k=config.k,
                         tau_hours=config.tau_hours,
-                        inventory_yes=inventory_yes,
+                        inventory_yes=inventory_for_ticker,
                     )
                 )
             lines.append(line)

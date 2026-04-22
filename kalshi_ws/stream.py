@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 import websockets
 
+from kalshi_as.inventory import get_inventory_state
 from kalshi_ingest.auth import KalshiAuth
 
 from .models import MarketTicker, Trade
@@ -190,6 +191,10 @@ def _handle_trade(msg: dict) -> None:
     buf.append(trade)
 
 
+def _handle_fill(msg: dict) -> None:
+    get_inventory_state().apply_fill(msg)
+
+
 def _handle_subscribed(data: dict) -> None:
     msg = data.get("msg", {})
     channel = msg.get("channel", "")
@@ -211,7 +216,7 @@ def _handle_error(data: dict) -> None:
 async def _subscribe(ws: Any, cmd_id_start: int = 1) -> int:
     """Send subscribe commands for ticker and trade channels.  Returns next cmd id."""
     cmd_id = cmd_id_start
-    for channel in ("ticker", "trade"):
+    for channel in ("ticker", "trade", "fill"):
         payload = {"id": cmd_id, "cmd": "subscribe", "params": {"channels": [channel]}}
         await ws.send(json.dumps(payload))
         logger.info("Sent subscribe cmd id=%d channel=%s", cmd_id, channel)
@@ -283,6 +288,12 @@ async def run_ws_stream(
                         except Exception:
                             logger.exception("Failed to process trade msg: %s", raw_message[:300])
                         writer.enqueue("trade", raw_message)
+
+                    elif msg_type == "fill":
+                        try:
+                            _handle_fill(data.get("msg", {}))
+                        except Exception:
+                            logger.exception("Failed to process fill msg: %s", raw_message[:300])
 
                     elif msg_type == "subscribed":
                         _handle_subscribed(data)

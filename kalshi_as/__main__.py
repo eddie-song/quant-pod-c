@@ -5,11 +5,13 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from kalshi_ws.stream import run_ws_stream
 
+from .inventory import get_inventory_state, sync_inventory_from_positions
 from .model import ASConfig
 from .strategy_loop import run_as_strategy_loop
 
@@ -28,6 +30,23 @@ def main() -> None:
     parser.add_argument("--tau-hours", type=float, default=4.0, help="Horizon (T−t) in hours")
     parser.add_argument("--tick", type=float, default=0.01, help="Price tick for rounding (dollars)")
     parser.add_argument("--inventory", type=float, default=0.0, help="YES inventory (contracts); + = long YES")
+    parser.add_argument(
+        "--inventory-mode",
+        choices=("live", "fallback"),
+        default="live",
+        help="Use live per-ticker inventory from positions/fills, or a fixed fallback inventory value.",
+    )
+    parser.add_argument(
+        "--inventory-seed-file",
+        type=str,
+        default="",
+        help="Optional JSON file of ticker -> YES inventory used as a startup seed/fallback.",
+    )
+    parser.add_argument(
+        "--skip-inventory-sync",
+        action="store_true",
+        help="Skip the startup REST sync from /portfolio/positions when inventory mode is live.",
+    )
     parser.add_argument("--min-spread", type=float, default=0.02, help="Only markets with YES spread ≥ this")
     parser.add_argument("--max-markets", type=int, default=12, help="Max markets to log per cycle")
     parser.add_argument("--mid-history", type=int, default=80, help="Rolling mids per ticker")
@@ -51,8 +70,16 @@ def main() -> None:
     trade_buffer = int(os.getenv("KALSHI_WS_TRADE_BUFFER", "5000"))
 
     cfg = ASConfig(gamma=args.gamma, k=args.k, tau_hours=args.tau_hours, tick=args.tick)
+    inventory_state = get_inventory_state()
+
+    if args.inventory_seed_file:
+        loaded = inventory_state.load_seed_file(Path(args.inventory_seed_file))
+        logging.getLogger(__name__).info("Loaded %d inventory seed entries from %s", loaded, args.inventory_seed_file)
 
     async def _run() -> None:
+        if args.inventory_mode == "live" and not args.skip_inventory_sync:
+            await asyncio.to_thread(sync_inventory_from_positions, inventory_state)
+
         await asyncio.gather(
             run_ws_stream(
                 base_url=base_url or None,
@@ -63,6 +90,7 @@ def main() -> None:
                 interval_s=args.interval,
                 config=cfg,
                 inventory_yes=args.inventory,
+                use_live_inventory=args.inventory_mode == "live",
                 min_spread=args.min_spread,
                 max_markets=args.max_markets,
                 mid_history_len=args.mid_history,
