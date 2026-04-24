@@ -2,21 +2,27 @@ import glob
 import json
 import os
 import sys
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
 
 # Repo root must be on sys.path so `kalshi_ws` imports work when Streamlit runs
 # from another cwd or via file:// launcher.
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+load_dotenv(_ROOT / ".env", override=False)
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+from kalshi_ingest.auth import KalshiAuth
+from kalshi_ingest.client import KalshiClient
 from kalshi_ws.models import MarketTicker, Trade
 
 
@@ -177,9 +183,18 @@ def _trade_microstructure(df_market: pd.DataFrame) -> Dict[str, Any]:
         den = np.maximum(np.abs(prices[:-1]), 1e-4)
         r = rets / den
         if len(r) >= 4 and float(np.nanstd(r)) > 1e-8:
-            rho = float(np.corrcoef(r[:-1], r[1:])[0, 1])
-            if not np.isnan(rho):
-                out["reversion_01"] = float(np.clip(0.5 * (1.0 - rho), 0.0, 1.0))
+            r0 = r[:-1]
+            r1 = r[1:]
+            # Guard against zero-variance slices to avoid RuntimeWarning from corrcoef.
+            if (
+                len(r0) >= 2
+                and len(r1) >= 2
+                and float(np.nanstd(r0)) > 1e-10
+                and float(np.nanstd(r1)) > 1e-10
+            ):
+                rho = float(np.corrcoef(r0, r1)[0, 1])
+                if np.isfinite(rho):
+                    out["reversion_01"] = float(np.clip(0.5 * (1.0 - rho), 0.0, 1.0))
             vol = float(np.std(r))
             tgt, sigma_bw = 0.025, 0.03
             out["trade_vol_score"] = float(
@@ -267,6 +282,64 @@ def _status_badge(age_s: float, stale_after_s: float) -> str:
     return "Receiving" if age_s <= stale_after_s else "Stale"
 
 
+@st.cache_resource(show_spinner=False)
+def _get_kalshi_client() -> KalshiClient:
+    key_path = str(os.getenv("KALSHI_PRIVATE_KEY_PATH", "")).strip()
+    if key_path and not os.path.isabs(key_path):
+        os.environ["KALSHI_PRIVATE_KEY_PATH"] = str((_ROOT / key_path).resolve())
+    return KalshiClient(KalshiAuth.from_env())
+
+
+def _order_response_obj(resp: Dict[str, Any]) -> Dict[str, Any]:
+    order = resp.get("order")
+    if isinstance(order, dict):
+        return order
+    return resp
+
+
+def _extract_order_id(order_like: Dict[str, Any]) -> str:
+    for k in ("order_id", "id"):
+        v = order_like.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _extract_remaining_count(order_like: Dict[str, Any]) -> int:
+    for k in ("remaining_count", "remaining_contract_count", "resting_count", "count"):
+        v = order_like.get(k)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _extract_price(order_like: Dict[str, Any]) -> Optional[int]:
+    for k in ("yes_price", "price", "limit_price", "price_cents"):
+        v = order_like.get(k)
+        try:
+            if v is not None:
+                return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _safe_market_preview(client: Optional[KalshiClient], ticker: str) -> Optional[Dict[str, Any]]:
+    if client is None:
+        return None
+    tkr = str(ticker or "").strip()
+    if not tkr:
+        return None
+    try:
+        resp = client.get_market(tkr)
+    except Exception:
+        return None
+    market = resp.get("market")
+    return market if isinstance(market, dict) else None
+
+
 st.set_page_config(page_title="Kalshi Trades Dashboard", layout="wide")
 
 out_dir = os.getenv("KALSHI_WS_OUT_DIR", "data/kalshi/ws")
@@ -282,6 +355,16 @@ st.sidebar.slider("Auto-refresh (ms)", min_value=500, max_value=5000, value=2000
 st.sidebar.slider("Max trades to keep", min_value=50, max_value=2000, value=500, step=50, key="dash_max_trades")
 st.sidebar.slider("Max AS sample rows to keep", min_value=20, max_value=500, value=150, step=10, key="dash_max_sample_rows")
 st.sidebar.slider("Mark stale after (seconds)", min_value=2, max_value=120, value=10, step=1, key="dash_stale_after_s")
+st.sidebar.slider("Active orders to fetch", min_value=10, max_value=500, value=100, step=10, key="dash_orders_limit")
+st.sidebar.number_input(
+    "Testing max contracts per order",
+    min_value=1,
+    max_value=1,
+    value=1,
+    step=1,
+    key="dash_test_max_contracts",
+    help="Hard cap applied to new orders and sell-market actions in this dashboard.",
+)
 
 st.sidebar.subheader("Viable markets (MM)")
 st.sidebar.slider("Min book spread ($)", min_value=0.0, max_value=0.25, value=0.01, step=0.005, key="dash_mm_min_spread")
@@ -353,6 +436,10 @@ if "ticker_states" not in st.session_state:
     st.session_state.ticker_states = {}
 if "spread_hist" not in st.session_state:
     st.session_state.spread_hist = {}
+if "active_orders" not in st.session_state:
+    st.session_state.active_orders = []
+if "order_flash" not in st.session_state:
+    st.session_state.order_flash = None
 
 st.title("Live Kalshi Trades")
 with st.expander("How viable market scoring works (data limits)"):
@@ -388,6 +475,7 @@ def _live_dashboard() -> None:
     min_recent_trades = int(st.session_state.dash_mm_min_trades)
     viable_top_n = int(st.session_state.dash_mm_top_n)
     ticker_tail_mb = int(st.session_state.dash_ticker_tail_mb)
+    test_max_contracts = int(st.session_state.get("dash_test_max_contracts", 5))
     mm_mid_low = float(st.session_state.dash_mm_mid_low)
     mm_mid_high = float(st.session_state.dash_mm_mid_high)
     mm_max_book_spread = float(st.session_state.dash_mm_max_book_spread)
@@ -517,6 +605,194 @@ def _live_dashboard() -> None:
     ws2.metric("Ticker stream", tick_status, f"{tick_age_s:.1f}s since write" if tick_age_s is not None else "")
     ws3.metric("Trade file(os)", os.path.basename(latest_trade_file) if latest_trade_file else "—")
     ws4.metric("Output dir", out_dir)
+
+    st.subheader("Trade execution")
+    if st.session_state.order_flash:
+        flash = st.session_state.order_flash
+        level = str(flash.get("level") or "info")
+        msg = str(flash.get("message") or "")
+        if level == "success":
+            st.success(msg)
+        elif level == "error":
+            st.error(msg)
+        else:
+            st.info(msg)
+        st.session_state.order_flash = None
+
+    client: Optional[KalshiClient] = None
+    try:
+        client = _get_kalshi_client()
+    except Exception as exc:
+        st.error(f"Could not initialize Kalshi client from .env: {exc}")
+
+    ticker_choices = sorted(st.session_state.ticker_states.keys())
+    if not ticker_choices:
+        ticker_choices = sorted({str(x) for x in df.get("market_ticker", pd.Series(dtype=str)).dropna().unique()})
+    if "dash_trade_ticker" not in st.session_state:
+        st.session_state.dash_trade_ticker = ticker_choices[0] if ticker_choices else ""
+
+    selected_ticker_preview = str(st.session_state.get("dash_trade_ticker") or "").strip()
+    preview_market = _safe_market_preview(client, selected_ticker_preview)
+    st.caption("Contract preview (what YES/NO refers to)")
+    if preview_market is None and selected_ticker_preview:
+        st.info(f"No contract metadata available yet for `{selected_ticker_preview}`.")
+    elif preview_market is None:
+        st.info("Enter or pick a market ticker to preview the contract details.")
+    else:
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Ticker", str(preview_market.get("ticker") or selected_ticker_preview))
+        p2.metric("Status", str(preview_market.get("status") or "N/A"))
+        p3.metric("YES label", str(preview_market.get("yes_sub_title") or "YES outcome"))
+        p4.metric("NO label", str(preview_market.get("no_sub_title") or "NO outcome"))
+        title = str(preview_market.get("title") or "").strip()
+        subtitle = str(preview_market.get("subtitle") or "").strip()
+        if title:
+            st.write(f"**Market:** {title}")
+        if subtitle:
+            st.write(f"**Detail:** {subtitle}")
+
+    with st.form("place_trade_form", clear_on_submit=False):
+        form_cols = st.columns(4)
+        form_cols[0].text_input(
+            "Market ticker",
+            key="dash_trade_ticker",
+            help="Use exact Kalshi market ticker.",
+        )
+        side = form_cols[1].selectbox("Side", ["yes", "no"], index=0)
+        action = form_cols[2].selectbox("Action", ["buy", "sell"], index=0)
+        order_type = form_cols[3].selectbox("Order type", ["limit", "market"], index=0)
+        form_cols2 = st.columns(4)
+        count = int(
+            form_cols2[0].number_input(
+                "Contracts",
+                min_value=1,
+                max_value=max(1, test_max_contracts),
+                value=min(1, max(1, test_max_contracts)),
+                step=1,
+                help=f"Capped by testing max: {test_max_contracts}",
+            )
+        )
+        yes_price = int(form_cols2[1].number_input("YES price (cents)", min_value=1, max_value=99, value=50, step=1))
+        time_in_force = form_cols2[2].selectbox(
+            "Time in force",
+            ["good_till_canceled", "immediate_or_cancel", "fill_or_kill"],
+            index=0,
+        )
+        post_only = bool(form_cols2[3].checkbox("Post only", value=True))
+        submit_place = st.form_submit_button("Place trade", use_container_width=True)
+    market_ticker = str(st.session_state.get("dash_trade_ticker") or "").strip()
+
+    if submit_place:
+        if client is None:
+            st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
+            st.rerun()
+        if not market_ticker:
+            st.session_state.order_flash = {"level": "error", "message": "Market ticker is required."}
+            st.rerun()
+        payload: Dict[str, Any] = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": action,
+            "count": max(1, min(count, test_max_contracts)),
+            "type": order_type,
+            "client_order_id": str(uuid.uuid4()),
+            "time_in_force": time_in_force,
+            "post_only": bool(post_only and order_type == "limit"),
+        }
+        if order_type == "limit":
+            if side == "yes":
+                payload["yes_price"] = yes_price
+            else:
+                payload["no_price"] = yes_price
+        try:
+            placed = client.create_order(payload)
+            order_obj = _order_response_obj(placed)
+            placed_id = _extract_order_id(order_obj) or "n/a"
+            st.session_state.order_flash = {"level": "success", "message": f"Order submitted. order_id={placed_id}"}
+        except Exception as exc:
+            st.session_state.order_flash = {"level": "error", "message": f"Order submit failed: {exc}"}
+        st.rerun()
+
+    active_orders: List[Dict[str, Any]] = list(st.session_state.active_orders)
+    if client is not None:
+        try:
+            orders_page = client.get_orders(status="resting", limit=int(st.session_state.dash_orders_limit))
+            active_orders = [o for o in (orders_page.get("orders") or []) if isinstance(o, dict)]
+            st.session_state.active_orders = active_orders
+        except Exception as exc:
+            st.warning(f"Could not refresh active orders: {exc}")
+
+    st.subheader("Active orders")
+    if not active_orders:
+        st.info("No active (resting) orders found.")
+    else:
+        display_rows: List[Dict[str, Any]] = []
+        for o in active_orders:
+            display_rows.append(
+                {
+                    "order_id": _extract_order_id(o),
+                    "ticker": o.get("ticker"),
+                    "side": o.get("side"),
+                    "action": o.get("action"),
+                    "type": o.get("type"),
+                    "price": _extract_price(o),
+                    "remaining_count": _extract_remaining_count(o),
+                    "status": o.get("status"),
+                    "created_time": o.get("created_time") or o.get("created_ts"),
+                }
+            )
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+        for idx, row in enumerate(display_rows):
+            oid = str(row.get("order_id") or "").strip()
+            if not oid:
+                continue
+            c1, c2, c3 = st.columns([3, 1, 1])
+            c1.caption(
+                f"{row.get('ticker')} | {row.get('action')} {row.get('side')} "
+                f"{row.get('remaining_count')} @ {row.get('price') or 'mkt'}"
+            )
+            if c2.button("Cancel", key=f"cancel_{oid}_{idx}", use_container_width=True):
+                if client is None:
+                    st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
+                else:
+                    try:
+                        client.cancel_order(oid)
+                        st.session_state.order_flash = {"level": "success", "message": f"Canceled order {oid}."}
+                    except Exception as exc:
+                        st.session_state.order_flash = {"level": "error", "message": f"Cancel failed for {oid}: {exc}"}
+                st.rerun()
+            if c3.button("Sell mkt", key=f"sell_{oid}_{idx}", use_container_width=True):
+                if client is None:
+                    st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
+                    st.rerun()
+                ticker = str(row.get("ticker") or "").strip()
+                side_to_sell = str(row.get("side") or "yes").strip().lower()
+                qty = max(1, min(int(row.get("remaining_count") or 1), test_max_contracts))
+                if not ticker:
+                    st.session_state.order_flash = {"level": "error", "message": f"Order {oid} missing ticker; cannot sell."}
+                    st.rerun()
+                sell_payload = {
+                    "ticker": ticker,
+                    "side": side_to_sell,
+                    "action": "sell",
+                    "count": qty,
+                    "type": "market",
+                    "client_order_id": str(uuid.uuid4()),
+                    "time_in_force": "immediate_or_cancel",
+                    "post_only": False,
+                }
+                try:
+                    sold = client.create_order(sell_payload)
+                    sold_obj = _order_response_obj(sold)
+                    sold_id = _extract_order_id(sold_obj) or "n/a"
+                    st.session_state.order_flash = {
+                        "level": "success",
+                        "message": f"Submitted market sell for {ticker} ({qty}). order_id={sold_id}",
+                    }
+                except Exception as exc:
+                    st.session_state.order_flash = {"level": "error", "message": f"Market sell failed for {oid}: {exc}"}
+                st.rerun()
     
     st.subheader("Viable markets for market making")
 
