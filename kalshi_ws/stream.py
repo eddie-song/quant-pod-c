@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ import websockets
 
 from kalshi_ingest.auth import KalshiAuth
 
-from .models import MarketTicker, Trade
+from .models import Fill, MarketTicker, Trade
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +99,9 @@ class _DiskWriter:
         self._paths: Dict[str, Path] = {
             "ticker": self._out_dir / f"ticker_stream_{date_tag}.jsonl",
             "trade": self._out_dir / f"trade_stream_{date_tag}.jsonl",
+            "fill": self._out_dir / f"fill_stream_{date_tag}.jsonl",
         }
-        self._buffers: Dict[str, list] = {"ticker": [], "trade": []}
+        self._buffers: Dict[str, list] = {"ticker": [], "trade": [], "fill": []}
         self._lock = asyncio.Lock()
         self._running = False
 
@@ -146,8 +148,11 @@ class _DiskWriter:
 
 _market_states: Dict[str, MarketTicker] = {}
 _trade_buffers: Dict[str, deque] = {}
+_fill_buffers: Dict[str, deque] = {}
+_fills_all: deque = deque(maxlen=20000)
 _subscription_ids: Dict[str, int] = {}
 _trade_buffer_maxlen: int = 5000
+_fill_buffer_maxlen: int = 5000
 
 
 def get_market_states() -> Dict[str, MarketTicker]:
@@ -158,6 +163,14 @@ def get_market_states() -> Dict[str, MarketTicker]:
 def get_trade_buffer(market_ticker: str) -> deque:
     """Return the trade deque for a given market (empty deque if unseen)."""
     return _trade_buffers.get(market_ticker, deque(maxlen=_trade_buffer_maxlen))
+
+
+def consume_fills() -> list[Fill]:
+    """Drain and return fill events seen since last call (process-local)."""
+    out: list[Fill] = []
+    while _fills_all:
+        out.append(_fills_all.popleft())
+    return out
 
 
 def get_subscription_ids() -> Dict[str, int]:
@@ -190,6 +203,19 @@ def _handle_trade(msg: dict) -> None:
     buf.append(trade)
 
 
+def _handle_fill(msg: dict) -> None:
+    fill = Fill.from_msg(msg)
+    ticker = fill.market_ticker
+    if not ticker:
+        return
+    buf = _fill_buffers.get(ticker)
+    if buf is None:
+        buf = deque(maxlen=_fill_buffer_maxlen)
+        _fill_buffers[ticker] = buf
+    buf.append(fill)
+    _fills_all.append(fill)
+
+
 def _handle_subscribed(data: dict) -> None:
     msg = data.get("msg", {})
     channel = msg.get("channel", "")
@@ -211,7 +237,11 @@ def _handle_error(data: dict) -> None:
 async def _subscribe(ws: Any, cmd_id_start: int = 1) -> int:
     """Send subscribe commands for ticker and trade channels.  Returns next cmd id."""
     cmd_id = cmd_id_start
-    for channel in ("ticker", "trade"):
+    channels = ["ticker", "trade"]
+    # Optional user-scoped fill channel for inventory/PnL without REST polling.
+    if str(os.getenv("KALSHI_WS_ENABLE_FILLS", "")).strip().lower() in {"1", "true", "yes"}:
+        channels.append("fill")
+    for channel in channels:
         payload = {"id": cmd_id, "cmd": "subscribe", "params": {"channels": [channel]}}
         await ws.send(json.dumps(payload))
         logger.info("Sent subscribe cmd id=%d channel=%s", cmd_id, channel)
@@ -283,6 +313,14 @@ async def run_ws_stream(
                         except Exception:
                             logger.exception("Failed to process trade msg: %s", raw_message[:300])
                         writer.enqueue("trade", raw_message)
+
+                    elif msg_type == "fill":
+                        try:
+                            _handle_fill(data.get("msg", {}))
+                        except Exception:
+                            logger.exception("Failed to process fill msg: %s", raw_message[:300])
+                        # Fill persistence is optional; keep it in the same out_dir if enabled.
+                        writer.enqueue("fill", raw_message)
 
                     elif msg_type == "subscribed":
                         _handle_subscribed(data)

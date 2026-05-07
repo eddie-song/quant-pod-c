@@ -44,6 +44,21 @@ def _round_to_tick(x: float, tick: float) -> float:
     return round(x / tick) * tick
 
 
+def _floor_to_tick(x: float, tick: float) -> float:
+    if tick <= 0:
+        return x
+    # tiny epsilon to reduce float noise turning exact ticks into the prior tick
+    eps = 1e-12
+    return math.floor((x + eps) / tick) * tick
+
+
+def _ceil_to_tick(x: float, tick: float) -> float:
+    if tick <= 0:
+        return x
+    eps = 1e-12
+    return math.ceil((x - eps) / tick) * tick
+
+
 def compute_quotes(
     mid: float,
     *,
@@ -68,8 +83,9 @@ def compute_quotes(
 
     t = config.tick
     lo, hi = t, 1.0 - t
-    bid = min(max(_round_to_tick(bid_raw, t), lo), hi)
-    ask = min(max(_round_to_tick(ask_raw, t), lo), hi)
+    # Market-maker-safe rounding: never round bids up or asks down.
+    bid = min(max(_floor_to_tick(bid_raw, t), lo), hi)
+    ask = min(max(_ceil_to_tick(ask_raw, t), lo), hi)
     if bid >= ask:
         # Degenerate after clamping: collapse to one tick inside the raw band if possible
         mid_tick = _round_to_tick(v, t)

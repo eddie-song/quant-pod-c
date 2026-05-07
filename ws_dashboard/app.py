@@ -606,91 +606,81 @@ def _live_dashboard() -> None:
     ws3.metric("Trade file(os)", os.path.basename(latest_trade_file) if latest_trade_file else "—")
     ws4.metric("Output dir", out_dir)
 
-    st.subheader("Trade execution")
-    if st.session_state.order_flash:
-        flash = st.session_state.order_flash
-        level = str(flash.get("level") or "info")
-        msg = str(flash.get("message") or "")
-        if level == "success":
-            st.success(msg)
-        elif level == "error":
-            st.error(msg)
-        else:
-            st.info(msg)
-        st.session_state.order_flash = None
+    with st.expander("Trade execution (manual)", expanded=False):
+        if st.session_state.order_flash:
+            flash = st.session_state.order_flash
+            level = str(flash.get("level") or "info")
+            msg = str(flash.get("message") or "")
+            if level == "success":
+                st.success(msg)
+            elif level == "error":
+                st.error(msg)
+            else:
+                st.info(msg)
+            st.session_state.order_flash = None
 
-    client: Optional[KalshiClient] = None
-    try:
-        client = _get_kalshi_client()
-    except Exception as exc:
-        st.error(f"Could not initialize Kalshi client from .env: {exc}")
+        client: Optional[KalshiClient] = None
+        try:
+            client = _get_kalshi_client()
+        except Exception as exc:
+            st.error(f"Could not initialize Kalshi client from .env: {exc}")
 
-    ticker_choices = sorted(st.session_state.ticker_states.keys())
-    if not ticker_choices:
-        ticker_choices = sorted({str(x) for x in df.get("market_ticker", pd.Series(dtype=str)).dropna().unique()})
-    if "dash_trade_ticker" not in st.session_state:
-        st.session_state.dash_trade_ticker = ticker_choices[0] if ticker_choices else ""
+        # Identifier mode: for now, allow manual Market ID entry.
+        if "dash_id_mode" not in st.session_state:
+            st.session_state.dash_id_mode = "market_id"
+        if "dash_market_id" not in st.session_state:
+            st.session_state.dash_market_id = ""
+        if "dash_trade_ticker" not in st.session_state:
+            st.session_state.dash_trade_ticker = ""
 
-    selected_ticker_preview = str(st.session_state.get("dash_trade_ticker") or "").strip()
-    preview_market = _safe_market_preview(client, selected_ticker_preview)
-    st.caption("Contract preview (what YES/NO refers to)")
-    if preview_market is None and selected_ticker_preview:
-        st.info(f"No contract metadata available yet for `{selected_ticker_preview}`.")
-    elif preview_market is None:
-        st.info("Enter or pick a market ticker to preview the contract details.")
-    else:
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Ticker", str(preview_market.get("ticker") or selected_ticker_preview))
-        p2.metric("Status", str(preview_market.get("status") or "N/A"))
-        p3.metric("YES label", str(preview_market.get("yes_sub_title") or "YES outcome"))
-        p4.metric("NO label", str(preview_market.get("no_sub_title") or "NO outcome"))
-        title = str(preview_market.get("title") or "").strip()
-        subtitle = str(preview_market.get("subtitle") or "").strip()
-        if title:
-            st.write(f"**Market:** {title}")
-        if subtitle:
-            st.write(f"**Detail:** {subtitle}")
+        with st.form("place_trade_form", clear_on_submit=False):
+            form_cols = st.columns(4)
+            id_mode = form_cols[0].selectbox("Identifier", ["market_id", "ticker"], index=0, key="dash_id_mode")
+            if id_mode == "market_id":
+                form_cols[1].text_input("Market ID", key="dash_market_id", help="Paste the Kalshi market_id.")
+            else:
+                form_cols[1].text_input("Market ticker", key="dash_trade_ticker", help="Exact Kalshi market ticker.")
+            side = form_cols[2].selectbox("Side", ["yes", "no"], index=0)
+            action = form_cols[3].selectbox("Action", ["buy", "sell"], index=0)
 
-    with st.form("place_trade_form", clear_on_submit=False):
-        form_cols = st.columns(4)
-        form_cols[0].text_input(
-            "Market ticker",
-            key="dash_trade_ticker",
-            help="Use exact Kalshi market ticker.",
-        )
-        side = form_cols[1].selectbox("Side", ["yes", "no"], index=0)
-        action = form_cols[2].selectbox("Action", ["buy", "sell"], index=0)
-        order_type = form_cols[3].selectbox("Order type", ["limit", "market"], index=0)
-        form_cols2 = st.columns(4)
-        count = int(
-            form_cols2[0].number_input(
-                "Contracts",
-                min_value=1,
-                max_value=max(1, test_max_contracts),
-                value=min(1, max(1, test_max_contracts)),
-                step=1,
-                help=f"Capped by testing max: {test_max_contracts}",
+            form_cols2 = st.columns(4)
+            order_type = form_cols2[0].selectbox("Order type", ["limit", "market"], index=0)
+            count = int(
+                form_cols2[1].number_input(
+                    "Contracts",
+                    min_value=1,
+                    max_value=max(1, test_max_contracts),
+                    value=min(1, max(1, test_max_contracts)),
+                    step=1,
+                    help=f"Capped by testing max: {test_max_contracts}",
+                )
             )
-        )
-        yes_price = int(form_cols2[1].number_input("YES price (cents)", min_value=1, max_value=99, value=50, step=1))
-        time_in_force = form_cols2[2].selectbox(
-            "Time in force",
-            ["good_till_canceled", "immediate_or_cancel", "fill_or_kill"],
-            index=0,
-        )
-        post_only = bool(form_cols2[3].checkbox("Post only", value=True))
-        submit_place = st.form_submit_button("Place trade", use_container_width=True)
-    market_ticker = str(st.session_state.get("dash_trade_ticker") or "").strip()
+            yes_price = int(form_cols2[2].number_input("YES price (cents)", min_value=1, max_value=99, value=50, step=1))
+            post_only = bool(form_cols2[3].checkbox("Post only (limit only)", value=True))
+
+            time_in_force = st.selectbox(
+                "Time in force",
+                ["good_till_canceled", "immediate_or_cancel", "fill_or_kill"],
+                index=0,
+            )
+            submit_place = st.form_submit_button("Place trade", use_container_width=True)
+
+        market_id = str(st.session_state.get("dash_market_id") or "").strip()
+        market_ticker = str(st.session_state.get("dash_trade_ticker") or "").strip()
 
     if submit_place:
         if client is None:
             st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
             st.rerun()
-        if not market_ticker:
-            st.session_state.order_flash = {"level": "error", "message": "Market ticker is required."}
-            st.rerun()
+        if st.session_state.dash_id_mode == "market_id":
+            if not market_id:
+                st.session_state.order_flash = {"level": "error", "message": "Market ID is required."}
+                st.rerun()
+        else:
+            if not market_ticker:
+                st.session_state.order_flash = {"level": "error", "message": "Market ticker is required."}
+                st.rerun()
         payload: Dict[str, Any] = {
-            "ticker": market_ticker,
             "side": side,
             "action": action,
             "count": max(1, min(count, test_max_contracts)),
@@ -699,6 +689,10 @@ def _live_dashboard() -> None:
             "time_in_force": time_in_force,
             "post_only": bool(post_only and order_type == "limit"),
         }
+        if st.session_state.dash_id_mode == "market_id":
+            payload["market_id"] = market_id
+        else:
+            payload["ticker"] = market_ticker
         if order_type == "limit":
             if side == "yes":
                 payload["yes_price"] = yes_price
@@ -722,117 +716,101 @@ def _live_dashboard() -> None:
         except Exception as exc:
             st.warning(f"Could not refresh active orders: {exc}")
 
-    st.subheader("Active orders")
-    if not active_orders:
-        st.info("No active (resting) orders found.")
-    else:
-        display_rows: List[Dict[str, Any]] = []
-        for o in active_orders:
-            display_rows.append(
-                {
-                    "order_id": _extract_order_id(o),
-                    "ticker": o.get("ticker"),
-                    "side": o.get("side"),
-                    "action": o.get("action"),
-                    "type": o.get("type"),
-                    "price": _extract_price(o),
-                    "remaining_count": _extract_remaining_count(o),
-                    "status": o.get("status"),
-                    "created_time": o.get("created_time") or o.get("created_ts"),
-                }
-            )
-        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
-
-        for idx, row in enumerate(display_rows):
-            oid = str(row.get("order_id") or "").strip()
-            if not oid:
-                continue
-            c1, c2, c3 = st.columns([3, 1, 1])
-            c1.caption(
-                f"{row.get('ticker')} | {row.get('action')} {row.get('side')} "
-                f"{row.get('remaining_count')} @ {row.get('price') or 'mkt'}"
-            )
-            if c2.button("Cancel", key=f"cancel_{oid}_{idx}", use_container_width=True):
-                if client is None:
-                    st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
-                else:
-                    try:
-                        client.cancel_order(oid)
-                        st.session_state.order_flash = {"level": "success", "message": f"Canceled order {oid}."}
-                    except Exception as exc:
-                        st.session_state.order_flash = {"level": "error", "message": f"Cancel failed for {oid}: {exc}"}
-                st.rerun()
-            if c3.button("Sell mkt", key=f"sell_{oid}_{idx}", use_container_width=True):
-                if client is None:
-                    st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
-                    st.rerun()
-                ticker = str(row.get("ticker") or "").strip()
-                side_to_sell = str(row.get("side") or "yes").strip().lower()
-                qty = max(1, min(int(row.get("remaining_count") or 1), test_max_contracts))
-                if not ticker:
-                    st.session_state.order_flash = {"level": "error", "message": f"Order {oid} missing ticker; cannot sell."}
-                    st.rerun()
-                sell_payload = {
-                    "ticker": ticker,
-                    "side": side_to_sell,
-                    "action": "sell",
-                    "count": qty,
-                    "type": "market",
-                    "client_order_id": str(uuid.uuid4()),
-                    "time_in_force": "immediate_or_cancel",
-                    "post_only": False,
-                }
-                try:
-                    sold = client.create_order(sell_payload)
-                    sold_obj = _order_response_obj(sold)
-                    sold_id = _extract_order_id(sold_obj) or "n/a"
-                    st.session_state.order_flash = {
-                        "level": "success",
-                        "message": f"Submitted market sell for {ticker} ({qty}). order_id={sold_id}",
-                    }
-                except Exception as exc:
-                    st.session_state.order_flash = {"level": "error", "message": f"Market sell failed for {oid}: {exc}"}
-                st.rerun()
-    
-    st.subheader("Viable markets for market making")
-
-    rows_mm: List[Dict[str, Any]] = []
-    for tkr, mt in st.session_state.ticker_states.items():
-        if mt.yes_bid <= 0 or mt.yes_ask <= 0 or mt.yes_ask <= mt.yes_bid:
-            continue
-        mid = 0.5 * (mt.yes_bid + mt.yes_ask)
-        rows_mm.append(
-            {
-                "market_ticker": tkr,
-                "yes_bid": mt.yes_bid,
-                "yes_ask": mt.yes_ask,
-                "book_spread_dollars": round(mt.spread, 6),
-                "quoted_mid": round(mid, 6),
-                "volume_24h_fp": mt.volume,
-                "dollar_volume": int(mt.dollar_volume),
-                "open_interest_fp": mt.open_interest,
-                "dollar_open_interest": int(mt.dollar_open_interest),
-                "last_price_dollars": mt.last_price,
-            }
-        )
-    vdf_mm = pd.DataFrame(rows_mm)
-    if len(vdf_mm) == 0:
-        st.info(
-            "No two-sided **ticker** snapshots loaded yet. Run the Kalshi websocket so `ticker_stream_*.jsonl` is written under the output dir, "
-            "then refresh — book columns come from the ticker channel."
-        )
-    else:
-        if len(df) > 0 and "market_ticker" in df.columns:
-            tg = df.groupby("market_ticker", as_index=False).agg(
-                recent_trade_count=("size", "count"),
-                contracts_traded=("size", "sum"),
-            )
-            vdf_mm = vdf_mm.merge(tg, on="market_ticker", how="left")
+    with st.expander("Active orders", expanded=False):
+        if not active_orders:
+            st.info("No active (resting) orders found.")
         else:
-            vdf_mm["recent_trade_count"] = 0
-            vdf_mm["contracts_traded"] = np.nan
-        vdf_mm["recent_trade_count"] = vdf_mm["recent_trade_count"].fillna(0).astype(int)
-        vdf_mm["contracts_traded"] = vdf_mm["contracts_traded"].fillna(0.0)
+            display_rows: List[Dict[str, Any]] = []
+            for o in active_orders:
+                display_rows.append(
+                    {
+                        "order_id": _extract_order_id(o),
+                        "ticker": o.get("ticker"),
+                        "market_id": o.get("market_id") or o.get("id"),
+                        "side": o.get("side"),
+                        "action": o.get("action"),
+                        "type": o.get("type"),
+                        "price": _extract_price(o),
+                        "remaining_count": _extract_remaining_count(o),
+                        "status": o.get("status"),
+                        "created_time": o.get("created_time") or o.get("created_ts"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+            for idx, row in enumerate(display_rows):
+                oid = str(row.get("order_id") or "").strip()
+                if not oid:
+                    continue
+                c1, c2, c3 = st.columns([3, 1, 1])
+                c1.caption(
+                    f"{row.get('ticker')} | {row.get('action')} {row.get('side')} "
+                    f"{row.get('remaining_count')} @ {row.get('price') or 'mkt'}"
+                )
+                if c2.button("Cancel", key=f"cancel_{oid}_{idx}", use_container_width=True):
+                    if client is None:
+                        st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
+                    else:
+                        try:
+                            client.cancel_order(oid)
+                            st.session_state.order_flash = {"level": "success", "message": f"Canceled order {oid}."}
+                        except Exception as exc:
+                            st.session_state.order_flash = {"level": "error", "message": f"Cancel failed for {oid}: {exc}"}
+                    st.rerun()
+                if c3.button("Sell mkt", key=f"sell_{oid}_{idx}", use_container_width=True):
+                    if client is None:
+                        st.session_state.order_flash = {"level": "error", "message": "Kalshi client is not available."}
+                        st.rerun()
+                    ticker = str(row.get("ticker") or "").strip()
+                    side_to_sell = str(row.get("side") or "yes").strip().lower()
+                    qty = max(1, min(int(row.get("remaining_count") or 1), test_max_contracts))
+                    if not ticker:
+                        st.session_state.order_flash = {"level": "error", "message": f"Order {oid} missing ticker; cannot sell."}
+                        st.rerun()
+                    sell_payload = {
+                        "ticker": ticker,
+                        "side": side_to_sell,
+                        "action": "sell",
+                        "count": qty,
+                        "type": "market",
+                        "client_order_id": str(uuid.uuid4()),
+                        "time_in_force": "immediate_or_cancel",
+                        "post_only": False,
+                    }
+                    try:
+                        sold = client.create_order(sell_payload)
+                        sold_obj = _order_response_obj(sold)
+                        sold_id = _extract_order_id(sold_obj) or "n/a"
+                        st.session_state.order_flash = {
+                            "level": "success",
+                            "message": f"Submitted market sell for {ticker} ({qty}). order_id={sold_id}",
+                        }
+                    except Exception as exc:
+                        st.session_state.order_flash = {"level": "error", "message": f"Market sell failed for {oid}: {exc}"}
+                    st.rerun()
+    
+    with st.expander("Market making (viable markets)", expanded=False):
+
+        rows_mm: List[Dict[str, Any]] = []
+        for tkr, mt in st.session_state.ticker_states.items():
+            if mt.yes_bid <= 0 or mt.yes_ask <= 0 or mt.yes_ask <= mt.yes_bid:
+                continue
+            mid = 0.5 * (mt.yes_bid + mt.yes_ask)
+            rows_mm.append(
+                {
+                    "market_ticker": tkr,
+                    "yes_bid": mt.yes_bid,
+                    "yes_ask": mt.yes_ask,
+                    "book_spread_dollars": round(mt.spread, 6),
+                    "quoted_mid": round(mid, 6),
+                    "volume_24h_fp": mt.volume,
+                }
+            )
+        vdf_mm = pd.DataFrame(rows_mm)
+        if len(vdf_mm) == 0:
+            st.info("No ticker snapshots yet. Run the websocket and refresh.")
+        else:
+            st.dataframe(vdf_mm.sort_values("book_spread_dollars", ascending=False).head(50), use_container_width=True, hide_index=True)
     
         if len(df_samples) > 0 and "market_ticker" in df_samples.columns and "cycle_ts_utc" in df_samples.columns:
             samp = df_samples.sort_values("cycle_ts_utc").groupby("market_ticker", as_index=False).last()
