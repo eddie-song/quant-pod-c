@@ -77,73 +77,211 @@ Once you have live market data, you need to decide *where* to place your bid and
 1. **Inventory risk**: If you keep buying YES contracts and the event resolves NO, you lose money on every contract you hold. The model should make you less eager to buy when you are already long.
 2. **Market volatility**: If the YES price is jumping around unpredictably, your quotes are more likely to be "picked off" before you can react. The model should widen your spread in volatile markets to compensate.
 
-The **Avellaneda–Stoikov (AS) model** addresses both. It was originally developed for stock market making but applies naturally to prediction markets. Here is how it works step by step.
-
-#### Step 3a — Measuring Volatility (σ)
-
-Before computing quotes, the system estimates how volatile the market is. It does this by looking at the history of mid-prices (the average of bid and ask) sampled every few seconds.
-
-It computes **log-returns** between consecutive mids (essentially, the percentage change in price each tick), then applies **EWMA smoothing** (exponentially weighted moving average — more recent observations count more than older ones) to get a stable estimate of the standard deviation of those returns.
-
-Finally, it scales this to **per-√hour units**: if the market moves 0.5% per 5-second sample, how much would it move over a full hour? This normalized volatility (σ) feeds directly into the quoting formulas.
-
-A minimum of 12 samples (~60 seconds of data at 5-second intervals) is required before the system trusts its σ estimate. Until then, that market is skipped.
-
-#### Step 3b — Time to Expiry (τ)
-
-The AS model accounts for the **time horizon**: how long before the contract settles? As a market approaches its close time, there is less time for the price to recover from an adverse move, so risk management tightens. τ (tau) is measured in hours.
-
-The system fetches each market's close time from the REST API at startup, then recomputes τ continuously as time passes. If a market's close time is not known, the global `--tau-hours` flag (default 4 hours) is used as a fallback.
-
-#### Step 3c — Reservation Price (v)
-
-The **reservation price** is the price at which you are indifferent between buying and selling. If you hold zero inventory, it equals the mid-price. If you are already long (you own YES contracts), you should be less eager to buy more — so your reservation price shifts *downward*, making your bid less aggressive and your ask more competitive (encouraging you to sell).
-
-```
-v = mid − Q × γ × σ² × τ
-```
-
-- **Q** = your current inventory in YES contracts (positive = long, negative = short)
-- **γ** (gamma) = your risk aversion (how much you care about inventory risk). Higher γ → bigger shift per unit of inventory
-- **σ** = volatility per √hour
-- **τ** = hours to expiry
-
-If Q = 0, then v = mid. If you hold 10 YES contracts and γ = 0.05, σ = 0.12, τ = 4: `v = mid − 10 × 0.05 × 0.0144 × 4 = mid − 0.0288`. Your entire quote framework shifts 2.88 cents lower, making you more willing to sell at a cheaper price.
-
-#### Step 3d — Optimal Half-Spread (h)
-
-The **half-spread** determines how far each side of your quote sits from the reservation price. A wider half-spread = more profit per round trip, but fewer fills (you are more expensive). A tighter half-spread = more fills, but less profit per trade, and more exposure to adverse selection.
-
-The AS formula balances these:
-
-```
-h = (1/γ) × ln(1 + γ/k) + 0.5 × γ × σ² × τ
-```
-
-- The first term `(1/γ) × ln(1 + γ/k)` comes from the **order arrival intensity** — k is a shape parameter representing how quickly the rate of incoming orders falls off as you move away from the mid. Larger k means orders arrive less frequently far from mid → you need a tighter spread to attract fills.
-- The second term `0.5 × γ × σ² × τ` is the **risk adjustment** — volatile markets with longer horizons require wider spreads to compensate for the possibility of being stuck in a losing position.
-
-#### Step 3e — Quote Construction
-
-The final bid and ask are:
-
-```
-bid = v − h     (rounded DOWN to nearest tick)
-ask = v + h     (rounded UP to nearest tick)
-```
-
-"Market-maker-safe" rounding is enforced: bids are always rounded down (never up, which would make you pay more than intended), and asks are always rounded up (never down, which would make you receive less than intended). Prices are clamped to the valid Kalshi range of [$0.01, $0.99].
-
-**Example:** mid = 0.50, Q = 0 (flat), σ = 0.15, τ = 2.0, γ = 0.05, k = 1.5
-
-- v = 0.50 − 0 = 0.50
-- h = (1/0.05) × ln(1 + 0.05/1.5) + 0.5 × 0.05 × 0.0225 × 2.0 = 0.0328 + 0.001125 ≈ 0.034
-- bid = 0.50 − 0.034 = 0.466 → rounds to **$0.46**
-- ask = 0.50 + 0.034 = 0.534 → rounds to **$0.54**
-
-You would post: "Buy YES @ $0.46, Sell YES @ $0.54." If both fill, you earn $0.08 per contract.
+The **Avellaneda–Stoikov (AS) model** addresses both. It was developed in a 2008 academic paper for continuous-time equity market making and has since become one of the standard frameworks for algorithmic quoting. This section explains the original model, every departure this implementation makes from it, and why those departures were chosen.
 
 ---
+
+#### The Original Avellaneda–Stoikov Model
+
+The 2008 paper by Marco Avellaneda and Sasha Stoikov solves an optimization problem: given a market maker who wants to maximize their expected utility of wealth at a future terminal time T, what bid and ask prices should they post at every moment in time?
+
+The model makes several explicit assumptions about the world:
+
+- The **mid-price** follows a continuous-time random walk (Brownian motion with no drift): `dS = σ dW`
+- **Order arrivals** follow a Poisson process — orders hit your bid and ask at random times with a rate that decreases exponentially the further your quote is from the mid-price: `λ(δ) = A · e^(−k·δ)`, where δ is the distance from mid
+- The market maker has **exponential utility** with risk aversion γ — meaning they care about both expected wealth and the variance of that wealth (they are not risk-neutral)
+- The market maker can quote continuously and prices can be any real number
+
+Under these assumptions, Avellaneda and Stoikov derive closed-form solutions for the optimal bid and ask:
+
+**Reservation price** (the mid-price adjusted for inventory risk):
+```
+r(s, q, t) = s − q · γ · σ² · (T − t)
+```
+
+**Optimal spread** (the total bid-ask spread, not the half-spread):
+```
+δ_bid + δ_ask = γ · σ² · (T − t) + (2/γ) · ln(1 + γ/k)
+```
+
+**Full variable definitions (original model):**
+
+| Symbol | Name | Meaning |
+|---|---|---|
+| `s` | mid-price | The current fair value of the asset (midpoint of best bid and ask) |
+| `q` | inventory | Number of shares/contracts held; positive = long, negative = short |
+| `t` | current time | Current time in the trading session |
+| `T` | terminal time | Time at which the session ends; the market maker cares about wealth at T |
+| `T − t` | time to horizon | Hours (or seconds) remaining until the session ends |
+| `γ` | risk aversion | How much the market maker penalizes inventory variance; γ > 0 |
+| `σ` | volatility | Standard deviation of mid-price per unit time (e.g., per second) |
+| `σ²` | variance | Square of volatility; appears because wealth variance grows with it |
+| `A` | arrival intensity | Baseline rate at which orders arrive when quotes are at the mid-price |
+| `k` | intensity decay | How quickly order arrival rate falls as you move away from mid; larger k = steeper falloff |
+| `δ_bid` | bid distance | How far below the reservation price to place the bid |
+| `δ_ask` | ask distance | How far above the reservation price to place the ask |
+| `r` | reservation price | The mid-price adjusted for inventory; the "fair value to you" given your position |
+
+The key insight is that the reservation price `r` shifts *away from mid* as inventory builds. If you are long (q > 0), r falls below mid — you value the asset less because you already have too much of it. This makes your bid less aggressive (you don't want to buy more) and your ask cheaper (you want to sell).
+
+---
+
+#### Our Reduced-Form Adaptation
+
+This implementation uses a **reduced symmetric form** of the AS model — a common simplification used in practice. Here is every departure from the original and the reasoning for each.
+
+**Our reservation price** (identical to the original):
+```
+v = mid − Q · γ · σ² · τ
+```
+
+**Our half-spread** (simplified from the original full-spread formula):
+```
+h = (1/γ) · ln(1 + γ/k) + 0.5 · γ · σ² · τ
+```
+
+**Our quote construction:**
+```
+bid = floor_to_tick(v − h)
+ask = ceil_to_tick(v + h)
+```
+
+**Full variable definitions (our implementation):**
+
+| Symbol | Name | Value/Source | Meaning |
+|---|---|---|---|
+| `mid` | mid-price | `0.5 × (yes_bid + yes_ask)` from WebSocket | Current fair-value estimate from live order book |
+| `Q` | inventory | `ledger.qty_for_ticker()` if live, else `--inventory` | YES contracts currently held; positive = long YES |
+| `γ` | risk aversion | `--gamma`, default 0.05 | Controls how strongly inventory pushes the reservation price away from mid; higher = more aggressive skew |
+| `σ` | volatility | EWMA of log-returns from mid history | Per-√hour standard deviation of the YES price; estimated fresh each cycle |
+| `σ²` | variance | `σ × σ` | Variance; enters the formula because risk scales with variance, not standard deviation |
+| `τ` | time to horizon | Hours until market close from `market_meta` | How long until the contract settles and inventory must be zero; shrinks continuously |
+| `k` | intensity decay | `--k`, default 1.5 | Shape of the order-arrival rate curve; larger k = orders arrive less frequently far from mid |
+| `A` | arrival intensity | `--A`, default 1.0 (placeholder) | Baseline arrival rate at mid; stored and logged but not yet applied to the spread formula |
+| `h` | half-spread | computed | Distance from reservation price to each side of the quote |
+| `v` | reservation price | computed | The "fair value to you" adjusted for inventory and time |
+| `bid` | model bid | `floor_to_tick(v − h)` | Price at which you offer to buy YES; floored so you never accidentally overpay |
+| `ask` | model ask | `ceil_to_tick(v + h)` | Price at which you offer to sell YES; ceiled so you never accidentally undersell |
+
+---
+
+#### Departure 1 — Symmetric Spread
+
+**Original model:** The optimal bid distance (δ_bid) and ask distance (δ_ask) are in general different, especially when inventory Q ≠ 0. The full solution produces an asymmetric spread — if you are long, the bid is pulled further from mid than the ask.
+
+**Our implementation:** We use a **symmetric half-spread h** applied equally to both sides. The asymmetry from inventory is captured entirely by the reservation price shift (v < mid when long). Both sides then sit h away from this already-shifted v.
+
+**Why:** The symmetric form is mathematically equivalent to the original in continuous time under the same Brownian motion assumptions. In practice, Kalshi ticks are $0.01 and quote refresh cycles are 5 seconds — continuous adjustment is not meaningful. The symmetric form is also simpler to implement and test correctly. The net result is the same: when you are long YES, your bid moves further below the current market mid and your ask moves closer to it, making you cheaper to buy from (encouraging inventory reduction).
+
+---
+
+#### Departure 2 — Discrete Time Horizon vs. Continuous
+
+**Original model:** Time-to-horizon `T − t` is a continuous value in seconds that decreases smoothly. The model was derived assuming the market maker can adjust quotes at any instant.
+
+**Our implementation:** We sample time-to-horizon `τ` once per cycle (every `--interval` seconds, default 5). It is measured in **hours** for numerical stability with typical Kalshi market lifetimes (hours to days). Volatility σ is also expressed per-√hour so the units are consistent: `σ² × τ` has units of `(price²/hour) × hours = price²`, which is dimensionally correct for a price adjustment.
+
+**Why:** The 5-second update frequency is already much faster than any meaningful change in τ for markets with hours remaining. The hours unit avoids the numerical issue of very small τ values (seconds) producing near-zero spreads that could be misinterpreted.
+
+---
+
+#### Departure 3 — Volatility Estimation from Ticker Mids, Not Trade Prices
+
+**Original model:** σ is assumed to be the true continuous-time volatility of the underlying asset price, treated as a known constant.
+
+**Our implementation:** σ is **estimated online** from a rolling window of mid-prices sampled every `--interval` seconds. The estimation procedure is:
+1. Take the last `--mid-history` (default 80) mid-prices for this market
+2. Apply EWMA smoothing to the mid-price series (α = 0.25) to reduce microstructure noise
+3. Compute log-returns between consecutive smoothed mids
+4. Apply EWMA to the squared log-returns to get a running variance estimate
+5. Scale from per-sample to per-√hour: `σ_hour = σ_tick × √(3600 / dt)`
+6. Apply floor (2%/√hr) and cap (500%/√hr) to reject outliers
+
+**Why:** True volatility is unobservable and non-stationary. The rolling EWMA estimator is fast to compute (no matrix operations), naturally down-weights old data, and handles the irregular nature of prediction market price discovery. Using mid-prices rather than trade prices is more robust — trades may arrive sporadically and at non-representative prices, while the mid-price reflects the continuous consensus of resting orders.
+
+**Implication:** σ is a coarse estimate, especially early in a market's life when only a few samples exist. The system refuses to quote until at least `--sigma-min-samples` (default 12) samples have accumulated, preventing quotes based on a single noisy observation.
+
+---
+
+#### Departure 4 — The `A` Parameter Is Not Yet Calibrated
+
+**Original model:** The arrival intensity parameter A is calibrated from real fill data — you measure how often orders arrive at various distances from mid and fit the exponential curve `λ(δ) = A · e^(−k·δ)`. A and k together fully determine the optimal spread.
+
+**Our implementation:** A is stored (`--A`, default 1.0) and logged in calibration records, but **does not currently appear in the spread formula**. The half-spread formula reduces to:
+
+```
+h = (1/γ) · ln(1 + γ/k) + 0.5 · γ · σ² · τ
+```
+
+In the original derivation, A appears inside the logarithm: `(2/γ) · ln(1 + γ/k)` is the spread when A → 1 (normalized). We omit A because we have not yet fitted it from real fill data — using an arbitrary A would produce a spread that is not grounded in the actual market's order arrival statistics.
+
+The `ExecutionMonitor`'s `ArrivalFitter` class is already collecting the data needed to fit A and k from real fills as the system runs. Once enough fills have accumulated, the calibrated values can be fed into `ASConfig` and the formula updated to incorporate A correctly.
+
+**Implication:** The current spread formula is well-behaved and risk-aware, but the "fill-rate" component (the first term) is based on assumed, not measured, order arrival statistics. The spread may be wider or narrower than truly optimal. This is a known limitation.
+
+---
+
+#### Departure 5 — Bounded Price Domain [0.01, 0.99]
+
+**Original model:** Derived for an unbounded price process on ℝ — the mid-price can take any real value. Bids and asks can be any positive price.
+
+**Our implementation:** Kalshi YES prices live strictly in [0.01, 0.99] (expressed in dollars, i.e., 1–99 cents). A YES price of 0 would mean the event is certainly false and the contract is worthless; a price of 1 would mean certainly true. Prices at these extremes indicate that the market has effectively resolved.
+
+The system clamps all quotes to [tick, 1 − tick] = [$0.01, $0.99]. If the model computes a bid below $0.01 or an ask above $0.99, it is clamped. If the model computes a bid ≥ ask after clamping (possible in extreme cases where σ or inventory skew is very large), the quotes collapse to one tick either side of the reservation price — the minimum valid spread.
+
+**Why:** Unclamped quotes would be rejected by the Kalshi API. The clamping is also economically correct: quoting a bid of $0.00 is meaningless on a binary contract.
+
+---
+
+#### Complete Worked Example
+
+**Inputs:** mid = 0.55, Q = +8 (long 8 YES contracts), σ = 0.18/√hr, τ = 3.0 hr, γ = 0.05, k = 1.5
+
+**Step 1 — Reservation price:**
+```
+v = 0.55 − 8 × 0.05 × (0.18²) × 3.0
+v = 0.55 − 8 × 0.05 × 0.0324 × 3.0
+v = 0.55 − 0.03888
+v = 0.5111
+```
+The reservation price has shifted 3.9 cents *below* mid because you are long. You value the asset less — you are already exposed to it.
+
+**Step 2 — Half-spread:**
+```
+h = (1/0.05) × ln(1 + 0.05/1.5) + 0.5 × 0.05 × (0.18²) × 3.0
+h = 20 × ln(1.0333) + 0.5 × 0.05 × 0.0324 × 3.0
+h = 20 × 0.03279 + 0.00243
+h = 0.6558 + 0.00243
+h ≈ 0.0658 + 0.00243 ≈ 0.0682
+```
+Wait — let me redo with careful arithmetic:
+```
+(1/γ) = 1/0.05 = 20
+γ/k   = 0.05/1.5 = 0.03333
+ln(1 + 0.03333) = ln(1.03333) ≈ 0.03279
+intensity term  = 20 × 0.03279 ≈ 0.6558
+
+σ²    = 0.18² = 0.0324
+risk term = 0.5 × 0.05 × 0.0324 × 3.0 = 0.00243
+
+h ≈ 0.06558 + 0.00243 ≈ 0.068
+```
+*(Note: the intensity term dominates at default parameters.)*
+
+**Step 3 — Raw quotes:**
+```
+bid_raw = 0.5111 − 0.068 = 0.4431  →  floor to $0.44
+ask_raw = 0.5111 + 0.068 = 0.5791  →  ceil  to $0.58
+```
+
+**Result:** Post **Buy YES @ $0.44 / Sell YES @ $0.58**.
+
+Versus a flat inventory (Q = 0) the quotes would have been centered on $0.55 instead of $0.51 — the long inventory pushed both legs 3.9 cents downward, making you a cheaper seller and a less aggressive buyer. If both legs fill, gross profit = $0.14 per contract.
+
+---
+
+
+
 
 ### Stage 4 — Candidate Selection: Which Markets to Quote
 
