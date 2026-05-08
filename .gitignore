@@ -9,3 +9,6 @@ out/
 __pycache__/
 
 pod-c.txt
+demo-pod-c.txt
+
+scripts/

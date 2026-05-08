@@ -811,6 +811,21 @@ def _live_dashboard() -> None:
             st.info("No ticker snapshots yet. Run the websocket and refresh.")
         else:
             st.dataframe(vdf_mm.sort_values("book_spread_dollars", ascending=False).head(50), use_container_width=True, hide_index=True)
+
+        # Attach recent trade counts so sidebar filters don't KeyError when the trade stream is empty.
+        # `df` is the in-memory window of websocket trades loaded above.
+        if len(vdf_mm) > 0:
+            if len(df) > 0 and "market_ticker" in df.columns:
+                _tc = df["market_ticker"].value_counts()
+                vdf_mm["recent_trade_count"] = vdf_mm["market_ticker"].map(_tc).fillna(0).astype(int)
+                if "size" in df.columns:
+                    _contracts = df.groupby("market_ticker")["size"].sum()
+                    vdf_mm["contracts_traded"] = vdf_mm["market_ticker"].map(_contracts).fillna(0.0).astype(float)
+                else:
+                    vdf_mm["contracts_traded"] = 0.0
+            else:
+                vdf_mm["recent_trade_count"] = 0
+                vdf_mm["contracts_traded"] = 0.0
     
         if len(df_samples) > 0 and "market_ticker" in df_samples.columns and "cycle_ts_utc" in df_samples.columns:
             samp = df_samples.sort_values("cycle_ts_utc").groupby("market_ticker", as_index=False).last()
